@@ -12,6 +12,7 @@ set(LIBCXXABI_SOURCES
   cxa_vector.cpp
   cxa_virtual.cpp
   exception.cpp
+  fallback_malloc.cpp
   private_typeinfo.cpp
   stdexcept.cpp
   typeinfo.cpp
@@ -53,14 +54,14 @@ if (LIBCXXABI_ENABLE_THREADS)
 endif()
 
 append_if(libraries LIBCXXABI_HAS_C_LIB c)
-
 if (LIBCXXABI_USE_LLVM_UNWINDER)
-  if (NOT LIBCXXABI_BUILT_STANDALONE)
-    if (LIBUNWIND_ENABLE_SHARED)
-      list(APPEND libraries unwind_shared)
-    else()
-      list(APPEND libraries unwind_static)
-    endif()
+  # Prefer using the in-tree version of libunwind, either shared or static. If
+  # none are found fall back to using -lunwind.
+  # FIXME: Is it correct to prefer the static version of libunwind?
+  if (TARGET unwind_shared)
+    list(APPEND libraries unwind_shared)
+  elseif(TARGET unwind_static)
+    list(APPEND libraries unwind_static)
   else()
     list(APPEND libraries unwind)
   endif()
@@ -134,14 +135,17 @@ endif()
 add_custom_target(cxxabi DEPENDS ${LIBCXXABI_TARGETS})
 
 install(TARGETS ${LIBCXXABI_TARGETS}
-  LIBRARY DESTINATION lib${LIBCXXABI_LIBDIR_SUFFIX} COMPONENT libcxxabi
-  ARCHIVE DESTINATION lib${LIBCXXABI_LIBDIR_SUFFIX} COMPONENT libcxxabi
+  LIBRARY DESTINATION lib${LIBCXXABI_LIBDIR_SUFFIX} COMPONENT cxxabi
+  ARCHIVE DESTINATION lib${LIBCXXABI_LIBDIR_SUFFIX} COMPONENT cxxabi
   )
 
 if (NOT CMAKE_CONFIGURATION_TYPES)
-  add_custom_target(install-libcxxabi
+  add_custom_target(install-cxxabi
     DEPENDS cxxabi
     COMMAND "${CMAKE_COMMAND}"
-            -DCMAKE_INSTALL_COMPONENT=libcxxabi
+            -DCMAKE_INSTALL_COMPONENT=cxxabi
             -P "${LIBCXXABI_BINARY_DIR}/cmake_install.cmake")
+
+  # TODO: This is a legacy target name and should be removed at some point.
+  add_custom_target(install-libcxxabi DEPENDS install-cxxabi)
 endif()
