@@ -25,7 +25,7 @@ else()
   list(APPEND LIBCXXABI_SOURCES cxa_noexception.cpp)
 endif()
 
-if (UNIX AND NOT (APPLE OR CYGWIN))
+if (LIBCXXABI_ENABLE_THREADS AND UNIX AND NOT (APPLE OR CYGWIN))
   list(APPEND LIBCXXABI_SOURCES cxa_thread_atexit.cpp)
 endif()
 
@@ -94,6 +94,12 @@ endif()
 string(REPLACE ";" " " LIBCXXABI_COMPILE_FLAGS "${LIBCXXABI_COMPILE_FLAGS}")
 string(REPLACE ";" " " LIBCXXABI_LINK_FLAGS "${LIBCXXABI_LINK_FLAGS}")
 string(REPLACE ";" " " LIBCXXABI_SHARED_LINK_FLAGS "${LIBCXXABI_SHARED_LINK_FLAGS}")
+
+# FIXME: libc++abi.so will not link when modules are enabled because it depends
+# on symbols defined in libc++.so which has not yet been built.
+if (LLVM_ENABLE_MODULES)
+  string(REPLACE "-Wl,-z,defs" "" CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS}")
+endif()
 
 # Add a object library that contains the compiled source files.
 add_library(cxxabi_objects OBJECT ${LIBCXXABI_SOURCES} ${LIBCXXABI_HEADERS})
