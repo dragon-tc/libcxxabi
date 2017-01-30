@@ -1611,7 +1611,8 @@ parse_function_type(const char* first, const char* last, C& db)
                 {
                     if (t == last)
                     {
-                        db.names.pop_back();
+                        if (!db.names.empty())
+                          db.names.pop_back();
                         return first;
                     }
                     if (*t == 'E')
@@ -1927,10 +1928,11 @@ parse_type(const char* first, const char* last, C& db)
                             if (is_function)
                             {
                                 size_t p = db.names[k].second.size();
-                                if (db.names[k].second[p-2] == '&')
-                                    p -= 3;
-                                else if (db.names[k].second.back() == '&')
+                                if (db.names[k].second[p - 2] == '&' &&
+                                    db.names[k].second[p - 1] == '&')
                                     p -= 2;
+                                else if (db.names[k].second.back() == '&')
+                                    p -= 1;
                                 if (cv & 1)
                                 {
                                     db.names[k].second.insert(p, " const");
