@@ -8,6 +8,13 @@ if(POLICY CMP0042)
   cmake_policy(SET CMP0042 NEW) # Set MACOSX_RPATH=YES by default
 endif()
 
+# Add path for custom modules
+set(CMAKE_MODULE_PATH
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake"
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules"
+  ${CMAKE_MODULE_PATH}
+  )
+
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   project(libcxxabi)
 
@@ -124,6 +131,7 @@ endif()
 #===============================================================================
 # Setup CMake Options
 #===============================================================================
+include(HandleCompilerRT)
 
 # Define options.
 option(LIBCXXABI_ENABLE_EXCEPTIONS "Use exceptions." ON)
@@ -502,9 +510,14 @@ if (LIBCXXABI_USE_LLVM_UNWINDER OR LLVM_NATIVE_ARCH MATCHES ARM)
     set(LIBCXXABI_LIBUNWIND_SOURCES "")
   endif()
 
-  if (NOT LIBCXXABI_LIBUNWIND_INCLUDES_INTERNAL STREQUAL "LIBCXXABI_LIBUNWIND_INCLUDES_INTERNAL-NOTFOUND")
+  if (LIBCXXABI_LIBUNWIND_INCLUDES_INTERNAL STREQUAL "LIBCXXABI_LIBUNWIND_INCLUDES_INTERNAL-NOTFOUND")
+    set(LIBCXXABI_LIBUNWIND_INCLUDES_INTERNAL "")
+  endif()
+
+  if (NOT LIBCXXABI_LIBUNWIND_INCLUDES_INTERNAL STREQUAL "")
     include_directories("${LIBCXXABI_LIBUNWIND_INCLUDES_INTERNAL}")
   endif()
+
   if (NOT LIBCXXABI_LIBUNWIND_SOURCES STREQUAL "")
     include_directories("${LIBCXXABI_LIBUNWIND_SOURCES}")
   endif()
