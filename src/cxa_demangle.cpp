@@ -10,8 +10,8 @@
 // FIXME: (possibly) incomplete list of features that clang mangles that this
 // file does not yet support:
 //   - enable_if attribute
-//   - decomposition declarations
 //   - C++ modules TS
+//   - All C++14 and C++17 features
 
 #define _LIBCPP_NO_EXCEPTIONS
 
@@ -20,6 +20,7 @@
 #include <vector>
 #include <algorithm>
 #include <numeric>
+#include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,20 +33,15 @@
 #endif
 #endif
 
-namespace __cxxabiv1
-{
+#ifndef NDEBUG
+#if __has_attribute(noinline) && __has_attribute(used)
+#define DUMP_METHOD __attribute__((noinline,used))
+#else
+#define DUMP_METHOD
+#endif
+#endif
 
-namespace
-{
-
-enum
-{
-    unknown_error = -4,
-    invalid_args = -3,
-    invalid_mangled_name,
-    memory_alloc_failure,
-    success
-};
+namespace {
 
 class StringView {
   const char *First;
@@ -82,6 +78,7 @@ public:
   const char *begin() const { return First; }
   const char *end() const { return Last; }
   size_t size() const { return static_cast<size_t>(Last - First); }
+  bool empty() const { return First == Last; }
 };
 
 bool operator==(const StringView &LHS, const StringView &RHS) {
@@ -110,6 +107,10 @@ public:
   OutputStream(char *StartBuf, size_t Size)
       : Buffer(StartBuf), CurrentPosition(0), BufferCapacity(Size) {}
 
+  /// If a ParameterPackExpansion (or similar type) is encountered, the offset
+  /// into the pack that we're currently printing.
+  unsigned CurrentPackIndex = std::numeric_limits<unsigned>::max();
+
   OutputStream &operator+=(StringView R) {
     size_t Size = R.size();
     if (Size == 0)
@@ -126,41 +127,7 @@ public:
     return *this;
   }
 
-  // Offset of position in buffer, used for building stream_string_view.
-  typedef unsigned StreamPosition;
-
-  // StringView into a stream, used for caching the ast nodes.
-  class StreamStringView {
-    StreamPosition First, Last;
-
-    friend class OutputStream;
-
-  public:
-    StreamStringView() : First(0), Last(0) {}
-
-    StreamStringView(StreamPosition First_, StreamPosition Last_)
-        : First(First_), Last(Last_) {}
-
-    bool empty() const { return First == Last; }
-  };
-
-  OutputStream &operator+=(StreamStringView &s) {
-    size_t Sz = static_cast<size_t>(s.Last - s.First);
-    if (Sz == 0)
-      return *this;
-    grow(Sz);
-    memmove(Buffer + CurrentPosition, Buffer + s.First, Sz);
-    CurrentPosition += Sz;
-    return *this;
-  }
-
-  StreamPosition getCurrentPosition() const {
-    return static_cast<StreamPosition>(CurrentPosition);
-  }
-
-  StreamStringView makeStringViewFromPastPosition(StreamPosition Pos) {
-    return StreamStringView(Pos, getCurrentPosition());
-  }
+  size_t getCurrentPosition() const { return CurrentPosition; };
 
   char back() const {
     return CurrentPosition ? Buffer[CurrentPosition - 1] : '\0';
@@ -171,6 +138,21 @@ public:
   char *getBuffer() { return Buffer; }
   char *getBufferEnd() { return Buffer + CurrentPosition - 1; }
   size_t getBufferCapacity() { return BufferCapacity; }
+};
+
+template <class T>
+class SwapAndRestore {
+  T &Restore;
+  T OriginalValue;
+public:
+  SwapAndRestore(T& Restore_, T NewVal)
+      : Restore(Restore_), OriginalValue(Restore) {
+    Restore = std::move(NewVal);
+  }
+  ~SwapAndRestore() { Restore = std::move(OriginalValue); }
+
+  SwapAndRestore(const SwapAndRestore &) = delete;
+  SwapAndRestore &operator=(const SwapAndRestore &) = delete;
 };
 
 // Base class of all AST nodes. The AST is built by the parser, then is
@@ -192,7 +174,7 @@ public:
     KPointerToMemberType,
     KArrayType,
     KFunctionType,
-    KTopLevelFunctionDecl,
+    KFunctionEncoding,
     KFunctionQualType,
     KFunctionRefQualType,
     KLiteralOperator,
@@ -201,7 +183,10 @@ public:
     KQualifiedName,
     KEmptyName,
     KVectorType,
-    KTemplateParams,
+    KParameterPack,
+    KTemplateArgumentPack,
+    KParameterPackExpansion,
+    KTemplateArgs,
     KNameWithTemplateArgs,
     KGlobalQualifiedName,
     KStdQualifiedName,
@@ -214,28 +199,71 @@ public:
     KExpr,
   };
 
-  const Kind K;
+  static constexpr unsigned NoParameterPack =
+    std::numeric_limits<unsigned>::max();
+  unsigned ParameterPackSize = NoParameterPack;
 
-private:
-  // If this Node has any RHS part, potentally many Nodes further down.
-  const unsigned HasRHSComponent : 1;
-  const unsigned HasFunction : 1;
-  const unsigned HasArray : 1;
+  Kind K;
 
-public:
-  Node(Kind K_, bool HasRHS_ = false, bool HasFunction_ = false,
-       bool HasArray_ = false)
-      : K(K_), HasRHSComponent(HasRHS_), HasFunction(HasFunction_),
-        HasArray(HasArray_) {}
+  /// Three-way bool to track a cached value. Unknown is possible if this node
+  /// has an unexpanded parameter pack below it that may affect this cache.
+  enum class Cache : unsigned char { Yes, No, Unknown, };
 
-  bool hasRHSComponent() const { return HasRHSComponent; }
-  bool hasArray() const { return HasArray; }
-  bool hasFunction() const { return HasFunction; }
+  /// Tracks if this node has a component on its right side, in which case we
+  /// need to call printRight.
+  Cache RHSComponentCache;
 
-  void print(OutputStream &s) const {
-    printLeft(s);
-    if (hasRHSComponent())
-      printRight(s);
+  /// Track if this node is a (possibly qualified) array type. This can affect
+  /// how we format the output string.
+  Cache ArrayCache;
+
+  /// Track if this node is a (possibly qualified) function type. This can
+  /// affect how we format the output string.
+  Cache FunctionCache;
+
+  Node(Kind K_, unsigned ParameterPackSize_ = NoParameterPack,
+       Cache RHSComponentCache_ = Cache::No, Cache ArrayCache_ = Cache::No,
+       Cache FunctionCache_ = Cache::No)
+      : ParameterPackSize(ParameterPackSize_), K(K_),
+        RHSComponentCache(RHSComponentCache_), ArrayCache(ArrayCache_),
+        FunctionCache(FunctionCache_) {}
+
+  bool containsUnexpandedParameterPack() const {
+    return ParameterPackSize != NoParameterPack;
+  }
+
+  bool hasRHSComponent(OutputStream &S) const {
+    if (RHSComponentCache != Cache::Unknown)
+      return RHSComponentCache == Cache::Yes;
+    return hasRHSComponentSlow(S);
+  }
+
+  bool hasArray(OutputStream &S) const {
+    if (ArrayCache != Cache::Unknown)
+      return ArrayCache == Cache::Yes;
+    return hasArraySlow(S);
+  }
+
+  bool hasFunction(OutputStream &S) const {
+    if (FunctionCache != Cache::Unknown)
+      return FunctionCache == Cache::Yes;
+    return hasFunctionSlow(S);
+  }
+
+  Kind getKind() const { return K; }
+
+  virtual bool hasRHSComponentSlow(OutputStream &) const { return false; }
+  virtual bool hasArraySlow(OutputStream &) const { return false; }
+  virtual bool hasFunctionSlow(OutputStream &) const { return false; }
+
+  /// If this node is a pack expansion that expands to 0 elements. This can have
+  /// an effect on how we should format the output.
+  bool isEmptyPackExpansion() const;
+
+  void print(OutputStream &S) const {
+    printLeft(S);
+    if (RHSComponentCache != Cache::No)
+      printRight(S);
   }
 
   // Print the "left" side of this Node into OutputStream.
@@ -251,6 +279,17 @@ public:
 
   // Silence compiler warnings, this dtor will never be called.
   virtual ~Node() = default;
+
+#ifndef NDEBUG
+  DUMP_METHOD void dump() const {
+    char *Buffer = static_cast<char*>(std::malloc(1024));
+    OutputStream S(Buffer, 1024);
+    print(S);
+    S += '\0';
+    printf("Symbol dump for %p: %s\n", (const void*)this, S.getBuffer());
+    std::free(S.getBuffer());
+  }
+#endif
 };
 
 class NodeArray {
@@ -258,17 +297,26 @@ class NodeArray {
   size_t NumElements;
 
 public:
-  NodeArray() : NumElements(0) {}
+  NodeArray() : Elements(nullptr), NumElements(0) {}
   NodeArray(Node **Elements_, size_t NumElements_)
       : Elements(Elements_), NumElements(NumElements_) {}
 
   bool empty() const { return NumElements == 0; }
   size_t size() const { return NumElements; }
 
-  void printWithSeperator(OutputStream &S, StringView Seperator) const {
+  Node **begin() const { return Elements; }
+  Node **end() const { return Elements + NumElements; }
+
+  Node *operator[](size_t Idx) const { return Elements[Idx]; }
+
+  void printWithComma(OutputStream &S) const {
+    bool FirstElement = true;
     for (size_t Idx = 0; Idx != NumElements; ++Idx) {
-      if (Idx)
-        S += Seperator;
+      if (Elements[Idx]->isEmptyPackExpansion())
+        continue;
+      if (!FirstElement)
+        S += ", ";
+      FirstElement = false;
       Elements[Idx]->print(S);
     }
   }
@@ -291,20 +339,22 @@ public:
 };
 
 class VendorExtQualType final : public Node {
-  const Node *Ext;
   const Node *Ty;
+  const Node *Ext;
 
 public:
-  VendorExtQualType(Node *Ext_, Node *Ty_)
-      : Node(KVendorExtQualType), Ext(Ext_), Ty(Ty_) {}
+  VendorExtQualType(Node *Ty_, Node *Ext_)
+      : Node(KVendorExtQualType,
+             std::min(Ty_->ParameterPackSize, Ext_->ParameterPackSize)),
+        Ty(Ty_), Ext(Ext_) {}
+
+  const Node* getQual() const { return Ext; }
 
   void printLeft(OutputStream &S) const override {
-    Ext->print(S);
+    Ty->print(S);
     S += " ";
-    Ty->printLeft(S);
+    Ext->print(S);
   }
-
-  void printRight(OutputStream &S) const override { Ty->printRight(S); }
 };
 
 enum Qualifiers {
@@ -334,14 +384,19 @@ protected:
 
 public:
   QualType(Node *Child_, Qualifiers Quals_)
-      : Node(KQualType, Child_->hasRHSComponent(), Child_->hasFunction(),
-             Child_->hasArray()),
+      : Node(KQualType, Child_->ParameterPackSize, Child_->RHSComponentCache,
+             Child_->ArrayCache, Child_->FunctionCache),
         Quals(Quals_), Child(Child_) {}
 
-  QualType(Node::Kind ChildKind_, Node *Child_, Qualifiers Quals_)
-      : Node(ChildKind_, Child_->hasRHSComponent(), Child_->hasFunction(),
-             Child_->hasArray()),
-        Quals(Quals_), Child(Child_) {}
+  bool hasRHSComponentSlow(OutputStream &S) const override {
+    return Child->hasRHSComponent(S);
+  }
+  bool hasArraySlow(OutputStream &S) const override {
+    return Child->hasArray(S);
+  }
+  bool hasFunctionSlow(OutputStream &S) const override {
+    return Child->hasFunction(S);
+  }
 
   void printLeft(OutputStream &S) const override {
     Child->printLeft(S);
@@ -355,7 +410,8 @@ class ConversionOperatorType final : public Node {
   const Node *Ty;
 
 public:
-  ConversionOperatorType(Node *Ty_) : Node(KConversionOperatorType), Ty(Ty_) {}
+  ConversionOperatorType(Node *Ty_)
+      : Node(KConversionOperatorType, Ty_->ParameterPackSize), Ty(Ty_) {}
 
   void printLeft(OutputStream &S) const override {
     S += "operator ";
@@ -369,14 +425,13 @@ class PostfixQualifiedType final : public Node {
 
 public:
   PostfixQualifiedType(Node *Ty_, StringView Postfix_)
-      : Node(KPostfixQualifiedType), Ty(Ty_), Postfix(Postfix_) {}
+      : Node(KPostfixQualifiedType, Ty_->ParameterPackSize),
+        Ty(Ty_), Postfix(Postfix_) {}
 
   void printLeft(OutputStream &s) const override {
     Ty->printLeft(s);
     s += Postfix;
   }
-
-  void printRight(OutputStream &S) const override { Ty->printRight(S); }
 };
 
 class NameType final : public Node {
@@ -396,7 +451,9 @@ class AbiTagAttr final : public Node {
   StringView Tag;
 public:
   AbiTagAttr(const Node* Base_, StringView Tag_)
-      : Node(KAbiTagAttr), Base(Base_), Tag(Tag_) {}
+      : Node(KAbiTagAttr, Base_->ParameterPackSize, Base_->RHSComponentCache,
+             Base_->ArrayCache, Base_->FunctionCache),
+        Base(Base_), Tag(Tag_) {}
 
   void printLeft(OutputStream &S) const override {
     Base->printLeft(S);
@@ -417,14 +474,14 @@ public:
       : Node(KObjCProtoName), Ty(Ty_), Protocol(Protocol_) {}
 
   bool isObjCObject() const {
-    return Ty->K == KNameType &&
+    return Ty->getKind() == KNameType &&
            static_cast<NameType *>(Ty)->getName() == "objc_object";
   }
 
   void printLeft(OutputStream &S) const override {
-    Ty->printLeft(S);
+    Ty->print(S);
     S += "<";
-    Protocol->printLeft(S);
+    Protocol->print(S);
     S += ">";
   }
 };
@@ -434,16 +491,22 @@ class PointerType final : public Node {
 
 public:
   PointerType(Node *Pointee_)
-      : Node(KPointerType, Pointee_->hasRHSComponent()), Pointee(Pointee_) {}
+      : Node(KPointerType, Pointee_->ParameterPackSize,
+             Pointee_->RHSComponentCache),
+        Pointee(Pointee_) {}
+
+  bool hasRHSComponentSlow(OutputStream &S) const override {
+    return Pointee->hasRHSComponent(S);
+  }
 
   void printLeft(OutputStream &s) const override {
     // We rewrite objc_object<SomeProtocol>* into id<SomeProtocol>.
-    if (Pointee->K != KObjCProtoName ||
+    if (Pointee->getKind() != KObjCProtoName ||
         !static_cast<const ObjCProtoName *>(Pointee)->isObjCObject()) {
       Pointee->printLeft(s);
-      if (Pointee->hasArray())
+      if (Pointee->hasArray(s))
         s += " ";
-      if (Pointee->hasArray() || Pointee->hasFunction())
+      if (Pointee->hasArray(s) || Pointee->hasFunction(s))
         s += "(";
       s += "*";
     } else {
@@ -455,9 +518,9 @@ public:
   }
 
   void printRight(OutputStream &s) const override {
-    if (Pointee->K != KObjCProtoName ||
+    if (Pointee->getKind() != KObjCProtoName ||
         !static_cast<const ObjCProtoName *>(Pointee)->isObjCObject()) {
-      if (Pointee->hasArray() || Pointee->hasFunction())
+      if (Pointee->hasArray(s) || Pointee->hasFunction(s))
         s += ")";
       Pointee->printRight(s);
     }
@@ -469,20 +532,25 @@ class LValueReferenceType final : public Node {
 
 public:
   LValueReferenceType(Node *Pointee_)
-      : Node(KLValueReferenceType, Pointee_->hasRHSComponent()),
+      : Node(KLValueReferenceType, Pointee_->ParameterPackSize,
+             Pointee_->RHSComponentCache),
         Pointee(Pointee_) {}
+
+  bool hasRHSComponentSlow(OutputStream &S) const override {
+    return Pointee->hasRHSComponent(S);
+  }
 
   void printLeft(OutputStream &s) const override {
     Pointee->printLeft(s);
-    if (Pointee->hasArray())
+    if (Pointee->hasArray(s))
       s += " ";
-    if (Pointee->hasArray() || Pointee->hasFunction())
+    if (Pointee->hasArray(s) || Pointee->hasFunction(s))
       s += "(&";
     else
       s += "&";
   }
   void printRight(OutputStream &s) const override {
-    if (Pointee->hasArray() || Pointee->hasFunction())
+    if (Pointee->hasArray(s) || Pointee->hasFunction(s))
       s += ")";
     Pointee->printRight(s);
   }
@@ -493,21 +561,26 @@ class RValueReferenceType final : public Node {
 
 public:
   RValueReferenceType(Node *Pointee_)
-      : Node(KRValueReferenceType, Pointee_->hasRHSComponent()),
+      : Node(KRValueReferenceType, Pointee_->ParameterPackSize,
+             Pointee_->RHSComponentCache),
         Pointee(Pointee_) {}
+
+  bool hasRHSComponentSlow(OutputStream &S) const override {
+    return Pointee->hasRHSComponent(S);
+  }
 
   void printLeft(OutputStream &s) const override {
     Pointee->printLeft(s);
-    if (Pointee->hasArray())
+    if (Pointee->hasArray(s))
       s += " ";
-    if (Pointee->hasArray() || Pointee->hasFunction())
+    if (Pointee->hasArray(s) || Pointee->hasFunction(s))
       s += "(&&";
     else
       s += "&&";
   }
 
   void printRight(OutputStream &s) const override {
-    if (Pointee->hasArray() || Pointee->hasFunction())
+    if (Pointee->hasArray(s) || Pointee->hasFunction(s))
       s += ")";
     Pointee->printRight(s);
   }
@@ -519,12 +592,19 @@ class PointerToMemberType final : public Node {
 
 public:
   PointerToMemberType(Node *ClassType_, Node *MemberType_)
-      : Node(KPointerToMemberType, MemberType_->hasRHSComponent()),
+      : Node(KPointerToMemberType,
+             std::min(MemberType_->ParameterPackSize,
+                      ClassType_->ParameterPackSize),
+             MemberType_->RHSComponentCache),
         ClassType(ClassType_), MemberType(MemberType_) {}
+
+  bool hasRHSComponentSlow(OutputStream &S) const override {
+    return MemberType->hasRHSComponent(S);
+  }
 
   void printLeft(OutputStream &s) const override {
     MemberType->printLeft(s);
-    if (MemberType->hasArray() || MemberType->hasFunction())
+    if (MemberType->hasArray(s) || MemberType->hasFunction(s))
       s += "(";
     else
       s += " ";
@@ -533,7 +613,7 @@ public:
   }
 
   void printRight(OutputStream &s) const override {
-    if (MemberType->hasArray() || MemberType->hasFunction())
+    if (MemberType->hasArray(s) || MemberType->hasFunction(s))
       s += ")";
     MemberType->printRight(s);
   }
@@ -581,10 +661,24 @@ class ArrayType final : public Node {
 
 public:
   ArrayType(Node *Base_, NodeOrString Dimension_)
-      : Node(KArrayType, true, false, true), Base(Base_), Dimension(Dimension_) {}
+      : Node(KArrayType, Base_->ParameterPackSize,
+             /*RHSComponentCache=*/Cache::Yes,
+             /*ArrayCache=*/Cache::Yes),
+        Base(Base_), Dimension(Dimension_) {
+    if (Dimension.isNode())
+      ParameterPackSize =
+          std::min(ParameterPackSize, Dimension.asNode()->ParameterPackSize);
+  }
 
   // Incomplete array type.
-  ArrayType(Node *Base_) : Node(KArrayType, true, false, true), Base(Base_) {}
+  ArrayType(Node *Base_)
+      : Node(KArrayType, Base_->ParameterPackSize,
+             /*RHSComponentCache=*/Cache::Yes,
+             /*ArrayCache=*/Cache::Yes),
+        Base(Base_) {}
+
+  bool hasRHSComponentSlow(OutputStream &) const override { return true; }
+  bool hasArraySlow(OutputStream &) const override { return true; }
 
   void printLeft(OutputStream &S) const override { Base->printLeft(S); }
 
@@ -607,7 +701,16 @@ class FunctionType final : public Node {
 
 public:
   FunctionType(Node *Ret_, NodeArray Params_)
-      : Node(KFunctionType, true, true), Ret(Ret_), Params(Params_) {}
+      : Node(KFunctionType, Ret_->ParameterPackSize,
+             /*RHSComponentCache=*/Cache::Yes, /*ArrayCache=*/Cache::No,
+             /*FunctionCache=*/Cache::Yes),
+        Ret(Ret_), Params(Params_) {
+    for (Node *P : Params)
+      ParameterPackSize = std::min(ParameterPackSize, P->ParameterPackSize);
+  }
+
+  bool hasRHSComponentSlow(OutputStream &) const override { return true; }
+  bool hasFunctionSlow(OutputStream &) const override { return true; }
 
   // Handle C++'s ... quirky decl grammer by using the left & right
   // distinction. Consider:
@@ -623,26 +726,38 @@ public:
 
   void printRight(OutputStream &S) const override {
     S += "(";
-    Params.printWithSeperator(S, ", ");
+    Params.printWithComma(S);
     S += ")";
     Ret->printRight(S);
   }
 };
 
-class TopLevelFunctionDecl final : public Node {
+class FunctionEncoding final : public Node {
   const Node *Ret;
   const Node *Name;
   NodeArray Params;
 
 public:
-  TopLevelFunctionDecl(Node *Ret_, Node *Name_, NodeArray Params_)
-      : Node(KTopLevelFunctionDecl, true, true), Ret(Ret_), Name(Name_),
-        Params(Params_) {}
+  FunctionEncoding(Node *Ret_, Node *Name_, NodeArray Params_)
+      : Node(KFunctionEncoding, NoParameterPack,
+             /*RHSComponentCache=*/Cache::Yes, /*ArrayCache=*/Cache::No,
+             /*FunctionCache=*/Cache::Yes),
+        Ret(Ret_), Name(Name_), Params(Params_) {
+    for (Node *P : Params)
+      ParameterPackSize = std::min(ParameterPackSize, P->ParameterPackSize);
+    if (Ret)
+      ParameterPackSize = std::min(ParameterPackSize, Ret->ParameterPackSize);
+  }
+
+  bool hasRHSComponentSlow(OutputStream &) const override { return true; }
+  bool hasFunctionSlow(OutputStream &) const override { return true; }
+
+  Node *getName() { return const_cast<Node *>(Name); }
 
   void printLeft(OutputStream &S) const override {
     if (Ret) {
       Ret->printLeft(S);
-      if (!Ret->hasRHSComponent())
+      if (!Ret->hasRHSComponent(S))
         S += " ";
     }
     Name->print(S);
@@ -650,7 +765,7 @@ public:
 
   void printRight(OutputStream &S) const override {
     S += "(";
-    Params.printWithSeperator(S, ", ");
+    Params.printWithComma(S);
     S += ")";
     if (Ret)
       Ret->printRight(S);
@@ -671,7 +786,13 @@ class FunctionRefQualType : public Node {
 
 public:
   FunctionRefQualType(Node *Fn_, FunctionRefQual Quals_)
-      : Node(KFunctionRefQualType, true, true), Fn(Fn_), Quals(Quals_) {}
+      : Node(KFunctionRefQualType, Fn_->ParameterPackSize,
+             /*RHSComponentCache=*/Cache::Yes, /*ArrayCache=*/Cache::No,
+             /*FunctionCache=*/Cache::Yes),
+        Fn(Fn_), Quals(Quals_) {}
+
+  bool hasFunctionSlow(OutputStream &) const override { return true; }
+  bool hasRHSComponentSlow(OutputStream &) const override { return true; }
 
   void printQuals(OutputStream &S) const {
     if (Quals == FrefQualLValue)
@@ -691,12 +812,14 @@ public:
 class FunctionQualType final : public QualType {
 public:
   FunctionQualType(Node *Child_, Qualifiers Quals_)
-      : QualType(KFunctionQualType, Child_, Quals_) {}
+      : QualType(Child_, Quals_) {
+    K = KFunctionQualType;
+  }
 
   void printLeft(OutputStream &S) const override { Child->printLeft(S); }
 
   void printRight(OutputStream &S) const override {
-    if (Child->K == KFunctionRefQualType) {
+    if (Child->getKind() == KFunctionRefQualType) {
       auto *RefQuals = static_cast<const FunctionRefQualType *>(Child);
       RefQuals->Fn->printRight(S);
       printQuals(S);
@@ -712,7 +835,8 @@ class LiteralOperator : public Node {
   const Node *OpName;
 
 public:
-  LiteralOperator(Node *OpName_) : Node(KLiteralOperator), OpName(OpName_) {}
+  LiteralOperator(Node *OpName_)
+      : Node(KLiteralOperator, OpName_->ParameterPackSize), OpName(OpName_) {}
 
   void printLeft(OutputStream &S) const override {
     S += "operator\"\" ";
@@ -725,8 +849,9 @@ class SpecialName final : public Node {
   const Node *Child;
 
 public:
-  SpecialName(StringView Special_, Node *Child_)
-      : Node(KSpecialName), Special(Special_), Child(Child_) {}
+  SpecialName(StringView Special_, Node* Child_)
+      : Node(KSpecialName, Child_->ParameterPackSize), Special(Special_),
+        Child(Child_) {}
 
   void printLeft(OutputStream &S) const override {
     S += Special;
@@ -740,8 +865,9 @@ class CtorVtableSpecialName final : public Node {
 
 public:
   CtorVtableSpecialName(Node *FirstType_, Node *SecondType_)
-      : Node(KCtorVtableSpecialName), FirstType(FirstType_),
-        SecondType(SecondType_) {}
+      : Node(KCtorVtableSpecialName, std::min(FirstType_->ParameterPackSize,
+                                              SecondType_->ParameterPackSize)),
+        FirstType(FirstType_), SecondType(SecondType_) {}
 
   void printLeft(OutputStream &S) const override {
     S += "construction vtable for ";
@@ -756,27 +882,18 @@ class QualifiedName final : public Node {
   const Node *Qualifier;
   const Node *Name;
 
-  mutable OutputStream::StreamStringView Cache;
-
 public:
-  QualifiedName(Node *Qualifier_, Node *Name_)
-      : Node(KQualifiedName), Qualifier(Qualifier_), Name(Name_) {}
+  QualifiedName(Node* Qualifier_, Node* Name_)
+      : Node(KQualifiedName,
+             std::min(Qualifier_->ParameterPackSize, Name_->ParameterPackSize)),
+        Qualifier(Qualifier_), Name(Name_) {}
 
   StringView getBaseName() const override { return Name->getBaseName(); }
 
   void printLeft(OutputStream &S) const override {
-    if (!Cache.empty()) {
-      S += Cache;
-      return;
-    }
-
-    OutputStream::StreamPosition Start = S.getCurrentPosition();
-    if (Qualifier->K != KEmptyName) {
-      Qualifier->print(S);
-      S += "::";
-    }
+    Qualifier->print(S);
+    S += "::";
     Name->print(S);
-    Cache = S.makeStringViewFromPastPosition(Start);
   }
 };
 
@@ -794,10 +911,17 @@ class VectorType final : public Node {
 public:
   VectorType(NodeOrString Dimension_)
       : Node(KVectorType), BaseType(nullptr), Dimension(Dimension_),
-        IsPixel(true) {}
+        IsPixel(true) {
+    if (Dimension.isNode())
+      ParameterPackSize = Dimension.asNode()->ParameterPackSize;
+  }
   VectorType(Node *BaseType_, NodeOrString Dimension_)
-      : Node(KVectorType), BaseType(BaseType_), Dimension(Dimension_),
-        IsPixel(false) {}
+      : Node(KVectorType, BaseType_->ParameterPackSize), BaseType(BaseType_),
+        Dimension(Dimension_), IsPixel(false) {
+    if (Dimension.isNode())
+      ParameterPackSize =
+          std::min(ParameterPackSize, Dimension.asNode()->ParameterPackSize);
+  }
 
   void printLeft(OutputStream &S) const override {
     if (IsPixel) {
@@ -816,29 +940,149 @@ public:
   }
 };
 
-class TemplateParams final : public Node {
-  NodeArray Params;
-
-  mutable OutputStream::StreamStringView Cache;
-
+/// An unexpanded parameter pack (either in the expression or type context). If
+/// this AST is correct, this node will have a ParameterPackExpansion node above
+/// it.
+///
+/// This node is created when some <template-args> are found that apply to an
+/// <encoding>, and is stored in the TemplateParams table. In order for this to
+/// appear in the final AST, it has to referenced via a <template-param> (ie,
+/// T_).
+class ParameterPack final : public Node {
+  NodeArray Data;
 public:
-  TemplateParams(NodeArray Params_) : Node(KTemplateParams), Params(Params_) {}
+  ParameterPack(NodeArray Data_)
+      : Node(KParameterPack, static_cast<unsigned>(Data_.size())), Data(Data_) {
+    ArrayCache = FunctionCache = RHSComponentCache = Cache::Unknown;
+    if (std::all_of(Data.begin(), Data.end(), [](Node* P) {
+          return P->ArrayCache == Cache::No;
+        }))
+      ArrayCache = Cache::No;
+    if (std::all_of(Data.begin(), Data.end(), [](Node* P) {
+          return P->FunctionCache == Cache::No;
+        }))
+      FunctionCache = Cache::No;
+    if (std::all_of(Data.begin(), Data.end(), [](Node* P) {
+          return P->RHSComponentCache == Cache::No;
+        }))
+      RHSComponentCache = Cache::No;
+  }
+
+  bool hasRHSComponentSlow(OutputStream &S) const override {
+    size_t Idx = S.CurrentPackIndex;
+    return Idx < Data.size() && Data[Idx]->hasRHSComponent(S);
+  }
+  bool hasArraySlow(OutputStream &S) const override {
+    size_t Idx = S.CurrentPackIndex;
+    return Idx < Data.size() && Data[Idx]->hasArray(S);
+  }
+  bool hasFunctionSlow(OutputStream &S) const override {
+    size_t Idx = S.CurrentPackIndex;
+    return Idx < Data.size() && Data[Idx]->hasFunction(S);
+  }
 
   void printLeft(OutputStream &S) const override {
-    if (!Cache.empty()) {
-      S += Cache;
+    size_t Idx = S.CurrentPackIndex;
+    if (Idx < Data.size())
+      Data[Idx]->printLeft(S);
+  }
+  void printRight(OutputStream &S) const override {
+    size_t Idx = S.CurrentPackIndex;
+    if (Idx < Data.size())
+      Data[Idx]->printRight(S);
+  }
+};
+
+/// A variadic template argument. This node represents an occurance of
+/// J<something>E in some <template-args>. It isn't itself unexpanded, unless
+/// one of it's Elements is. The parser inserts a ParameterPack into the
+/// TemplateParams table if the <template-args> this pack belongs to apply to an
+/// <encoding>.
+class TemplateArgumentPack final : public Node {
+  NodeArray Elements;
+public:
+  TemplateArgumentPack(NodeArray Elements_)
+      : Node(KTemplateArgumentPack), Elements(Elements_) {
+    for (Node *E : Elements)
+      ParameterPackSize = std::min(E->ParameterPackSize, ParameterPackSize);
+  }
+
+  NodeArray getElements() const { return Elements; }
+
+  void printLeft(OutputStream &S) const override {
+    Elements.printWithComma(S);
+  }
+};
+
+/// A pack expansion. Below this node, there are some unexpanded ParameterPacks
+/// which each have Child->ParameterPackSize elements.
+class ParameterPackExpansion final : public Node {
+  const Node *Child;
+
+public:
+  ParameterPackExpansion(Node* Child_)
+      : Node(KParameterPackExpansion), Child(Child_) {}
+
+  const Node *getChild() const { return Child; }
+
+  void printLeft(OutputStream &S) const override {
+    unsigned PackSize = Child->ParameterPackSize;
+    if (PackSize == NoParameterPack) {
+      Child->print(S);
+      S += "...";
       return;
     }
 
-    OutputStream::StreamPosition Start = S.getCurrentPosition();
+    SwapAndRestore<unsigned> SavePackIndex(S.CurrentPackIndex, 0);
+    for (unsigned I = 0; I != PackSize; ++I) {
+      if (I != 0)
+        S += ", ";
+      S.CurrentPackIndex = I;
+      Child->print(S);
+    }
+  }
+};
 
+inline bool Node::isEmptyPackExpansion() const {
+  if (getKind() == KParameterPackExpansion) {
+    auto *AsPack = static_cast<const ParameterPackExpansion *>(this);
+    return AsPack->getChild()->isEmptyPackExpansion();
+  }
+  if (getKind() == KTemplateArgumentPack) {
+    auto *AsTemplateArg = static_cast<const TemplateArgumentPack *>(this);
+    for (Node *E : AsTemplateArg->getElements())
+      if (!E->isEmptyPackExpansion())
+        return false;
+    return true;
+  }
+  return ParameterPackSize == 0;
+}
+
+class TemplateArgs final : public Node {
+  NodeArray Params;
+
+public:
+  TemplateArgs(NodeArray Params_) : Node(KTemplateArgs), Params(Params_) {
+    for (Node *P : Params)
+      ParameterPackSize = std::min(ParameterPackSize, P->ParameterPackSize);
+  }
+
+  NodeArray getParams() { return Params; }
+
+  void printLeft(OutputStream &S) const override {
     S += "<";
-    Params.printWithSeperator(S, ", ");
+    bool FirstElement = true;
+    for (size_t Idx = 0, E = Params.size(); Idx != E; ++Idx) {
+      if (Params[Idx]->isEmptyPackExpansion())
+        continue;
+      if (!FirstElement)
+        S += ", ";
+      FirstElement = false;
+      Params[Idx]->print(S);
+    }
     if (S.back() == '>')
       S += " ";
     S += ">";
-
-    Cache = S.makeStringViewFromPastPosition(Start);
   }
 };
 
@@ -849,7 +1093,9 @@ class NameWithTemplateArgs final : public Node {
 
 public:
   NameWithTemplateArgs(Node *Name_, Node *TemplateArgs_)
-      : Node(KNameWithTemplateArgs), Name(Name_), TemplateArgs(TemplateArgs_) {}
+      : Node(KNameWithTemplateArgs, std::min(Name_->ParameterPackSize,
+                                             TemplateArgs_->ParameterPackSize)),
+        Name(Name_), TemplateArgs(TemplateArgs_) {}
 
   StringView getBaseName() const override { return Name->getBaseName(); }
 
@@ -863,7 +1109,8 @@ class GlobalQualifiedName final : public Node {
   Node *Child;
 
 public:
-  GlobalQualifiedName(Node *Child_) : Node(KGlobalQualifiedName), Child(Child_) {}
+  GlobalQualifiedName(Node* Child_)
+      : Node(KGlobalQualifiedName, Child_->ParameterPackSize), Child(Child_) {}
 
   StringView getBaseName() const override { return Child->getBaseName(); }
 
@@ -877,7 +1124,8 @@ class StdQualifiedName final : public Node {
   Node *Child;
 
 public:
-  StdQualifiedName(Node *Child_) : Node(KStdQualifiedName), Child(Child_) {}
+  StdQualifiedName(Node *Child_)
+      : Node(KStdQualifiedName, Child_->ParameterPackSize), Child(Child_) {}
 
   StringView getBaseName() const override { return Child->getBaseName(); }
 
@@ -1000,7 +1248,8 @@ class CtorDtorName final : public Node {
 
 public:
   CtorDtorName(Node *Basename_, bool IsDtor_)
-      : Node(KCtorDtorName), Basename(Basename_), IsDtor(IsDtor_) {}
+      : Node(KCtorDtorName, Basename_->ParameterPackSize),
+        Basename(Basename_), IsDtor(IsDtor_) {}
 
   void printLeft(OutputStream &S) const override {
     if (IsDtor)
@@ -1013,7 +1262,9 @@ class DtorName : public Node {
   const Node *Base;
 
 public:
-  DtorName(Node *Base_) : Node(KDtorName), Base(Base_) {}
+  DtorName(Node *Base_) : Node(KDtorName), Base(Base_) {
+    ParameterPackSize = Base->ParameterPackSize;
+  }
 
   void printLeft(OutputStream &S) const override {
     S += "~";
@@ -1040,13 +1291,16 @@ class LambdaTypeName : public Node {
 
 public:
   LambdaTypeName(NodeArray Params_, StringView Count_)
-      : Node(KLambdaTypeName), Params(Params_), Count(Count_) {}
+      : Node(KLambdaTypeName), Params(Params_), Count(Count_) {
+    for (Node *P : Params)
+      ParameterPackSize = std::min(ParameterPackSize, P->ParameterPackSize);
+  }
 
   void printLeft(OutputStream &S) const override {
     S += "\'lambda";
     S += Count;
     S += "\'(";
-    Params.printWithSeperator(S, ", ");
+    Params.printWithComma(S);
     S += ")";
   }
 };
@@ -1064,7 +1318,10 @@ class BinaryExpr : public Expr {
 
 public:
   BinaryExpr(Node *LHS_, StringView InfixOperator_, Node *RHS_)
-      : LHS(LHS_), InfixOperator(InfixOperator_), RHS(RHS_) {}
+      : LHS(LHS_), InfixOperator(InfixOperator_), RHS(RHS_) {
+    ParameterPackSize =
+      std::min(LHS->ParameterPackSize, RHS->ParameterPackSize);
+  }
 
   void printLeft(OutputStream &S) const override {
     // might be a template argument expression, then we need to disambiguate
@@ -1090,7 +1347,10 @@ class ArraySubscriptExpr : public Expr {
   const Node *Op2;
 
 public:
-  ArraySubscriptExpr(Node *Op1_, Node *Op2_) : Op1(Op1_), Op2(Op2_) {}
+  ArraySubscriptExpr(Node *Op1_, Node *Op2_) : Op1(Op1_), Op2(Op2_) {
+    ParameterPackSize =
+      std::min(Op1->ParameterPackSize, Op2->ParameterPackSize);
+  }
 
   void printLeft(OutputStream &S) const override {
     S += "(";
@@ -1107,7 +1367,9 @@ class PostfixExpr : public Expr {
 
 public:
   PostfixExpr(Node *Child_, StringView Operand_)
-      : Child(Child_), Operand(Operand_) {}
+      : Child(Child_), Operand(Operand_) {
+    ParameterPackSize = Child->ParameterPackSize;
+  }
 
   void printLeft(OutputStream &S) const override {
     S += "(";
@@ -1124,7 +1386,11 @@ class ConditionalExpr : public Expr {
 
 public:
   ConditionalExpr(Node *Cond_, Node *Then_, Node *Else_)
-      : Cond(Cond_), Then(Then_), Else(Else_) {}
+      : Cond(Cond_), Then(Then_), Else(Else_) {
+    ParameterPackSize =
+        std::min(Cond->ParameterPackSize,
+                 std::min(Then->ParameterPackSize, Else->ParameterPackSize));
+  }
 
   void printLeft(OutputStream &S) const override {
     S += "(";
@@ -1144,7 +1410,10 @@ class MemberExpr : public Expr {
 
 public:
   MemberExpr(Node *LHS_, StringView Kind_, Node *RHS_)
-      : LHS(LHS_), Kind(Kind_), RHS(RHS_) {}
+      : LHS(LHS_), Kind(Kind_), RHS(RHS_) {
+    ParameterPackSize =
+      std::min(LHS->ParameterPackSize, RHS->ParameterPackSize);
+  }
 
   void printLeft(OutputStream &S) const override {
     LHS->print(S);
@@ -1160,7 +1429,9 @@ class EnclosingExpr : public Expr {
 
 public:
   EnclosingExpr(StringView Prefix_, Node *Infix_, StringView Postfix_)
-      : Prefix(Prefix_), Infix(Infix_), Postfix(Postfix_) {}
+      : Prefix(Prefix_), Infix(Infix_), Postfix(Postfix_) {
+    ParameterPackSize = Infix->ParameterPackSize;
+  }
 
   void printLeft(OutputStream &S) const override {
     S += Prefix;
@@ -1177,7 +1448,10 @@ class CastExpr : public Expr {
 
 public:
   CastExpr(StringView CastKind_, Node *To_, Node *From_)
-      : CastKind(CastKind_), To(To_), From(From_) {}
+      : CastKind(CastKind_), To(To_), From(From_) {
+    ParameterPackSize =
+      std::min(To->ParameterPackSize, From->ParameterPackSize);
+  }
 
   void printLeft(OutputStream &S) const override {
     S += CastKind;
@@ -1190,14 +1464,15 @@ public:
 };
 
 class SizeofParamPackExpr : public Expr {
-  NodeArray Args;
+  Node *Pack;
 
 public:
-  SizeofParamPackExpr(NodeArray Args_) : Args(Args_) {}
+  SizeofParamPackExpr(Node *Pack_) : Pack(Pack_) {}
 
   void printLeft(OutputStream &S) const override {
     S += "sizeof...(";
-    Args.printWithSeperator(S, ", ");
+    ParameterPackExpansion PPE(Pack);
+    PPE.printLeft(S);
     S += ")";
   }
 };
@@ -1207,12 +1482,16 @@ class CallExpr : public Expr {
   NodeArray Args;
 
 public:
-  CallExpr(Node *Callee_, NodeArray Args_) : Callee(Callee_), Args(Args_) {}
+  CallExpr(Node *Callee_, NodeArray Args_) : Callee(Callee_), Args(Args_) {
+    for (Node *P : Args)
+      ParameterPackSize = std::min(ParameterPackSize, P->ParameterPackSize);
+    ParameterPackSize = std::min(ParameterPackSize, Callee->ParameterPackSize);
+  }
 
   void printLeft(OutputStream &S) const override {
     Callee->print(S);
     S += "(";
-    Args.printWithSeperator(S, ", ");
+    Args.printWithComma(S);
     S += ")";
   }
 };
@@ -1227,8 +1506,15 @@ class NewExpr : public Expr {
 public:
   NewExpr(NodeArray ExprList_, Node *Type_, NodeArray InitList_, bool IsGlobal_,
           bool IsArray_)
-      : ExprList(ExprList_), Type(Type_), InitList(InitList_), IsGlobal(IsGlobal_),
-        IsArray(IsArray_) {}
+      : ExprList(ExprList_), Type(Type_), InitList(InitList_),
+        IsGlobal(IsGlobal_), IsArray(IsArray_) {
+    for (Node *E : ExprList)
+      ParameterPackSize = std::min(ParameterPackSize, E->ParameterPackSize);
+    for (Node *I : InitList)
+      ParameterPackSize = std::min(ParameterPackSize, I->ParameterPackSize);
+    if (Type)
+      ParameterPackSize = std::min(ParameterPackSize, Type->ParameterPackSize);
+  }
 
   void printLeft(OutputStream &S) const override {
     if (IsGlobal)
@@ -1236,17 +1522,19 @@ public:
     S += "new";
     if (IsArray)
       S += "[]";
+    S += ' ';
     if (!ExprList.empty()) {
       S += "(";
-      ExprList.printWithSeperator(S, ", ");
+      ExprList.printWithComma(S);
       S += ")";
     }
     Type->print(S);
     if (!InitList.empty()) {
       S += "(";
-      InitList.printWithSeperator(S, ", ");
+      InitList.printWithComma(S);
       S += ")";
     }
+
   }
 };
 
@@ -1257,7 +1545,9 @@ class DeleteExpr : public Expr {
 
 public:
   DeleteExpr(Node *Op_, bool IsGlobal_, bool IsArray_)
-      : Op(Op_), IsGlobal(IsGlobal_), IsArray(IsArray_) {}
+      : Op(Op_), IsGlobal(IsGlobal_), IsArray(IsArray_) {
+    ParameterPackSize = Op->ParameterPackSize;
+  }
 
   void printLeft(OutputStream &S) const override {
     if (IsGlobal)
@@ -1274,7 +1564,9 @@ class PrefixExpr : public Expr {
   Node *Child;
 
 public:
-  PrefixExpr(StringView Prefix_, Node *Child_) : Prefix(Prefix_), Child(Child_) {}
+  PrefixExpr(StringView Prefix_, Node *Child_) : Prefix(Prefix_), Child(Child_) {
+    ParameterPackSize = Child->ParameterPackSize;
+  }
 
   void printLeft(OutputStream &S) const override {
     S += Prefix;
@@ -1296,32 +1588,23 @@ public:
   }
 };
 
-class ExprList : public Expr {
-  NodeArray SubExprs;
-
-public:
-  ExprList(NodeArray SubExprs_) : SubExprs(SubExprs_) {}
-
-  void printLeft(OutputStream &S) const override {
-    S += "(";
-    SubExprs.printWithSeperator(S, ", ");
-    S += ")";
-  }
-};
-
 class ConversionExpr : public Expr {
+  const Node *Type;
   NodeArray Expressions;
-  NodeArray Types;
 
 public:
-  ConversionExpr(NodeArray Expressions_, NodeArray Types_)
-      : Expressions(Expressions_), Types(Types_) {}
+  ConversionExpr(const Node *Type_, NodeArray Expressions_)
+      : Type(Type_), Expressions(Expressions_) {
+    for (Node *E : Expressions)
+      ParameterPackSize = std::min(ParameterPackSize, E->ParameterPackSize);
+    ParameterPackSize = std::min(ParameterPackSize, Type->ParameterPackSize);
+  }
 
   void printLeft(OutputStream &S) const override {
     S += "(";
-    Expressions.printWithSeperator(S, ", ");
+    Type->print(S);
     S += ")(";
-    Types.printWithSeperator(S, ", ");
+    Expressions.printWithComma(S);
     S += ")";
   }
 };
@@ -1330,7 +1613,9 @@ class ThrowExpr : public Expr {
   const Node *Op;
 
 public:
-  ThrowExpr(Node *Op_) : Op(Op_) {}
+  ThrowExpr(Node *Op_) : Op(Op_) {
+    ParameterPackSize = Op->ParameterPackSize;
+  }
 
   void printLeft(OutputStream &S) const override {
     S += "throw ";
@@ -1355,7 +1640,9 @@ class IntegerCastExpr : public Expr {
   StringView Integer;
 
 public:
-  IntegerCastExpr(Node *Ty_, StringView Integer_) : Ty(Ty_), Integer(Integer_) {}
+  IntegerCastExpr(Node *Ty_, StringView Integer_) : Ty(Ty_), Integer(Integer_) {
+    ParameterPackSize = Ty->ParameterPackSize;
+  }
 
   void printLeft(OutputStream &S) const override {
     S += "(";
@@ -1593,139 +1880,839 @@ public:
   }
 };
 
-// Substitution table. This type is used to track the substitutions that are
-// known by the parser.
-template <size_t Size>
-class SubstitutionTable {
-  // Substitutions hold the actual entries in the table, and PackIndices tells
-  // us which entries are members of which pack. For example, if the
-  // substitutions we're tracking are: {int, {float, FooBar}, char}, with
-  // {float, FooBar} being a parameter pack, we represent the substitutions as:
-  // Substitutions: int, float, FooBar, char
-  // PackIndices:     0,             1,    3
-  // So, PackIndicies[I] holds the offset of the begin of the Ith pack, and
-  // PackIndices[I + 1] holds the offset of the end.
-  PODSmallVector<Node*, Size> Substitutions;
-  PODSmallVector<unsigned, Size> PackIndices;
+struct Db {
+  const char *First;
+  const char *Last;
 
-public:
-  // Add a substitution that represents a single name to the table. This is
-  // modeled as a parameter pack with just one element.
-  void pushSubstitution(Node* Entry) {
-    pushPack();
-    pushSubstitutionIntoPack(Entry);
+  // Name stack, this is used by the parser to hold temporary names that were
+  // parsed. The parser colapses multiple names into new nodes to construct
+  // the AST. Once the parser is finished, names.size() == 1.
+  PODSmallVector<Node *, 32> Names;
+
+  // Substitution table. Itanium supports name substitutions as a means of
+  // compression. The string "S42_" refers to the 44nd entry (base-36) in this
+  // table.
+  PODSmallVector<Node *, 32> Subs;
+
+  // Template parameter table. Like the above, but referenced like "T42_".
+  // This has a smaller size compared to Subs and Names because it can be
+  // stored on the stack.
+  PODSmallVector<Node *, 8> TemplateParams;
+
+  Qualifiers CV = QualNone;
+  FunctionRefQual RefQuals = FrefQualNone;
+  unsigned EncodingDepth = 0;
+  bool ParsedCtorDtorCV = false;
+  bool TagTemplates = true;
+  bool FixForwardReferences = false;
+  bool TryToParseTemplateArgs = true;
+
+  BumpPointerAllocator ASTAllocator;
+
+  template <class T, class... Args> T *make(Args &&... args) {
+    return new (ASTAllocator.allocate(sizeof(T)))
+        T(std::forward<Args>(args)...);
   }
 
-  // Add a new empty pack to the table. Subsequent calls to
-  // pushSubstitutionIntoPack() will add to this pack.
-  void pushPack() {
-    PackIndices.push_back(static_cast<unsigned>(Substitutions.size()));
-  }
-  void pushSubstitutionIntoPack(Node* Entry) {
-    assert(!PackIndices.empty() && "No pack to push substitution into!");
-    Substitutions.push_back(Entry);
+  template <class It> NodeArray makeNodeArray(It begin, It end) {
+    size_t sz = static_cast<size_t>(end - begin);
+    void *mem = ASTAllocator.allocate(sizeof(Node *) * sz);
+    Node **data = new (mem) Node *[sz];
+    std::copy(begin, end, data);
+    return NodeArray(data, sz);
   }
 
-  // Remove the last pack from the table.
-  void popPack() {
-    unsigned Last = PackIndices.back();
-    PackIndices.pop_back();
-    Substitutions.dropBack(Last);
+  NodeArray popTrailingNodeArray(size_t FromPosition) {
+    assert(FromPosition <= Names.size());
+    NodeArray res =
+        makeNodeArray(Names.begin() + (long)FromPosition, Names.end());
+    Names.dropBack(FromPosition);
+    return res;
   }
 
-  // For use in a range-for loop.
-  struct NodeRange {
-    Node** First;
-    Node** Last;
-    Node** begin() { return First; }
-    Node** end() { return Last; }
-  };
-
-  // Retrieve the Nth substitution. This is represented as a range, as the
-  // substitution could be referring to a parameter pack.
-  NodeRange nthSubstitution(size_t N) {
-    assert(PackIndices[N] <= Substitutions.size());
-    // The Nth parameter pack starts at offset PackIndices[N], and ends at
-    // PackIndices[N + 1].
-    Node** Begin = Substitutions.begin() + PackIndices[N];
-    Node** End;
-    if (N + 1 != PackIndices.size()) {
-      assert(PackIndices[N + 1] <= Substitutions.size());
-      End = Substitutions.begin() + PackIndices[N + 1];
-    } else
-      End = Substitutions.end();
-    assert(Begin <= End);
-    return NodeRange{Begin, End};
+  bool consumeIf(StringView S) {
+    if (StringView(First, Last).startsWith(S)) {
+      First += S.size();
+      return true;
+    }
+    return false;
   }
 
-  size_t size() const { return PackIndices.size(); }
-  bool empty() const { return PackIndices.empty(); }
-  void clear() {
-    Substitutions.clear();
-    PackIndices.clear();
+  bool consumeIf(char C) {
+    if (First != Last && *First == C) {
+      ++First;
+      return true;
+    }
+    return false;
+  }
+
+  char consume() { return First != Last ? *First++ : '\0'; }
+
+  char look(unsigned Lookahead = 0) {
+    if (static_cast<size_t>(Last - First) <= Lookahead)
+      return '\0';
+    return First[Lookahead];
+  }
+
+  size_t numLeft() const { return static_cast<size_t>(Last - First); }
+
+  StringView parseNumber(bool AllowNegative = false);
+  Qualifiers parseCVQualifiers();
+
+  /// Parse the <expr> production.
+  Node *parseExpr();
+  Node *parsePrefixExpr(StringView Kind);
+  Node *parseBinaryExpr(StringView Kind);
+  Node *parseIntegerLiteral(StringView Lit);
+  Node *parseExprPrimary();
+  template <class Float> Node *parseFloatingLiteral();
+  Node *parseFunctionParam();
+  Node *parseNewExpr();
+  Node *parseConversionExpr();
+
+  // FIXME: remove this when all the parse_* functions have been rewritten.
+  template <const char *(*parse_fn)(const char *, const char *, Db &)>
+  Node *legacyParse() {
+    size_t BeforeType = Names.size();
+    const char *OrigFirst = First;
+    const char *T = parse_fn(First, Last, *this);
+    if (T == OrigFirst || BeforeType + 1 != Names.size())
+      return nullptr;
+    First = T;
+    Node *R = Names.back();
+    Names.pop_back();
+    return R;
   }
 };
 
-struct Db
-{
-    // Name stack, this is used by the parser to hold temporary names that were
-    // parsed. The parser colapses multiple names into new nodes to construct
-    // the AST. Once the parser is finished, names.size() == 1.
-    PODSmallVector<Node*, 32> Names;
+const char *parse_expression(const char *first, const char *last, Db &db) {
+  db.First = first;
+  db.Last = last;
+  Node *R = db.parseExpr();
+  if (R == nullptr)
+    return first;
+  db.Names.push_back(R);
+  return db.First;
+}
 
-    // Substitution table. Itanium supports name substitutions as a means of
-    // compression. The string "S42_" refers to the 42nd entry in this table.
-    SubstitutionTable<32> Subs;
+const char *parse_expr_primary(const char *first, const char *last, Db &db) {
+  db.First = first;
+  db.Last = last;
+  Node *R = db.parseExprPrimary();
+  if (R == nullptr)
+    return first;
+  db.Names.push_back(R);
+  return db.First;
+}
 
-    // Template parameter table. Like the above, but referenced like "T42_".
-    // This has a smaller size compared to Subs and Names because it can be
-    // stored on the stack.
-    SubstitutionTable<4> TemplateParams;
+const char *parse_type(const char *first, const char *last, Db &db);
+const char *parse_encoding(const char *first, const char *last, Db &db);
+const char *parse_name(const char *first, const char *last, Db &db,
+                       bool *ends_with_template_args = 0);
+const char *parse_template_args(const char *first, const char *last, Db &db);
+const char *parse_template_param(const char *, const char *, Db &);
+const char *parse_operator_name(const char *first, const char *last, Db &db);
+const char *parse_unqualified_name(const char *first, const char *last, Db &db);
+const char *parse_decltype(const char *first, const char *last, Db &db);
+const char *parse_unresolved_name(const char *, const char *, Db &);
 
-    Qualifiers CV = QualNone;
-    FunctionRefQual RefQuals = FrefQualNone;
-    unsigned EncodingDepth = 0;
-    bool ParsedCtorDtorCV = false;
-    bool TagTemplates = true;
-    bool FixForwardReferences = false;
-    bool TryToParseTemplateArgs = true;
+// <number> ::= [n] <non-negative decimal integer>
+StringView Db::parseNumber(bool AllowNegative) {
+  const char *Tmp = First;
+  if (AllowNegative)
+    consumeIf('n');
+  if (numLeft() == 0 || !std::isdigit(*First))
+    return StringView();
+  while (numLeft() != 0 && std::isdigit(*First))
+    ++First;
+  return StringView(Tmp, First);
+}
 
-    BumpPointerAllocator ASTAllocator;
+Node *Db::parsePrefixExpr(StringView Kind) {
+  Node *E = parseExpr();
+  if (E == nullptr)
+    return nullptr;
+  return make<PrefixExpr>(Kind, E);
+}
 
-    template <class T, class... Args> T* make(Args&& ...args)
-    {
-        return new (ASTAllocator.allocate(sizeof(T)))
-            T(std::forward<Args>(args)...);
+Node *Db::parseBinaryExpr(StringView Kind) {
+  Node *LHS = parseExpr();
+  if (LHS == nullptr)
+    return nullptr;
+  Node *RHS = parseExpr();
+  if (RHS == nullptr)
+    return nullptr;
+  return make<BinaryExpr>(LHS, Kind, RHS);
+}
+
+Node *Db::parseIntegerLiteral(StringView Lit) {
+  StringView Tmp = parseNumber(true);
+  if (!Tmp.empty() && consumeIf('E'))
+    return make<IntegerExpr>(Lit, Tmp);
+  return nullptr;
+}
+
+Qualifiers Db::parseCVQualifiers() {
+  Qualifiers CVR = QualNone;
+  if (consumeIf('r'))
+    addQualifiers(CVR, QualRestrict);
+  if (consumeIf('V'))
+    addQualifiers(CVR, QualVolatile);
+  if (consumeIf('K'))
+    addQualifiers(CVR, QualConst);
+  return CVR;
+}
+
+// <function-param> ::= fp <top-level CV-Qualifiers> _                                     # L == 0, first parameter
+//                  ::= fp <top-level CV-Qualifiers> <parameter-2 non-negative number> _   # L == 0, second and later parameters
+//                  ::= fL <L-1 non-negative number> p <top-level CV-Qualifiers> _         # L > 0, first parameter
+//                  ::= fL <L-1 non-negative number> p <top-level CV-Qualifiers> <parameter-2 non-negative number> _   # L > 0, second and later parameters
+Node *Db::parseFunctionParam() {
+  if (consumeIf("fp")) {
+    parseCVQualifiers();
+    StringView Num = parseNumber();
+    if (!consumeIf('_'))
+      return nullptr;
+    return make<FunctionParam>(Num);
+  }
+  if (consumeIf("fL")) {
+    if (parseNumber().empty())
+      return nullptr;
+    if (!consumeIf('p'))
+      return nullptr;
+    parseCVQualifiers();
+    StringView Num = parseNumber();
+    if (!consumeIf('_'))
+      return nullptr;
+    return make<FunctionParam>(Num);
+  }
+  return nullptr;
+}
+
+// [gs] nw <expression>* _ <type> E                     # new (expr-list) type
+// [gs] nw <expression>* _ <type> <initializer>         # new (expr-list) type (init)
+// [gs] na <expression>* _ <type> E                     # new[] (expr-list) type
+// [gs] na <expression>* _ <type> <initializer>         # new[] (expr-list) type (init)
+// <initializer> ::= pi <expression>* E                 # parenthesized initialization
+Node *Db::parseNewExpr() {
+  bool Global = consumeIf("gs");
+  bool IsArray = look(1) == 'a';
+  if (!consumeIf("nw") && !consumeIf("na"))
+    return nullptr;
+  size_t Exprs = Names.size();
+  while (!consumeIf('_')) {
+    Node *Ex = parseExpr();
+    if (Ex == nullptr)
+      return nullptr;
+    Names.push_back(Ex);
+  }
+  NodeArray ExprList = popTrailingNodeArray(Exprs);
+  Node *Ty = legacyParse<parse_type>();
+  if (Ty == nullptr)
+    return Ty;
+  if (consumeIf("pi")) {
+    size_t InitsBegin = Names.size();
+    while (!consumeIf('E')) {
+      Node *Init = parseExpr();
+      if (Init == nullptr)
+        return Init;
+      Names.push_back(Init);
     }
+    NodeArray Inits = popTrailingNodeArray(InitsBegin);
+    return make<NewExpr>(ExprList, Ty, Inits, Global, IsArray);
+  } else if (!consumeIf('E'))
+    return nullptr;
+  return make<NewExpr>(ExprList, Ty, NodeArray(), Global, IsArray);
+}
 
-    template <class It> NodeArray makeNodeArray(It begin, It end)
-    {
-        size_t sz = static_cast<size_t>(end - begin);
-        void* mem = ASTAllocator.allocate(sizeof(Node*) * sz);
-        Node** data = new (mem) Node*[sz];
-        std::copy(begin, end, data);
-        return NodeArray(data, sz);
+// cv <type> <expression>                               # conversion with one argument
+// cv <type> _ <expression>* E                          # conversion with a different number of arguments
+Node *Db::parseConversionExpr() {
+  if (!consumeIf("cv"))
+    return nullptr;
+  Node *Ty;
+  {
+    SwapAndRestore<bool> SaveTemp(TryToParseTemplateArgs, false);
+    Ty = legacyParse<parse_type>();
+  }
+
+  if (Ty == nullptr)
+    return nullptr;
+
+  if (consumeIf('_')) {
+    size_t ExprsBegin = Names.size();
+    while (!consumeIf('E')) {
+      Node *E = parseExpr();
+      if (E == nullptr)
+        return E;
+      Names.push_back(E);
     }
+    NodeArray Exprs = popTrailingNodeArray(ExprsBegin);
+    return make<ConversionExpr>(Ty, Exprs);
+  }
 
-    NodeArray popTrailingNodeArray(size_t FromPosition)
-    {
-        assert(FromPosition <= Names.size());
-        NodeArray res = makeNodeArray(
-            Names.begin() + (long)FromPosition, Names.end());
-        Names.dropBack(FromPosition);
-        return res;
+  Node *E[1] = {parseExpr()};
+  if (E[0] == nullptr)
+    return nullptr;
+  return make<ConversionExpr>(Ty, makeNodeArray(E, E + 1));
+}
+
+// <expr-primary> ::= L <type> <value number> E                          # integer literal
+//                ::= L <type> <value float> E                           # floating literal
+//                ::= L <string type> E                                  # string literal
+//                ::= L <nullptr type> E                                 # nullptr literal (i.e., "LDnE")
+// FIXME:         ::= L <type> <real-part float> _ <imag-part float> E   # complex floating point literal (C 2000)
+//                ::= L <mangled-name> E                                 # external name
+Node *Db::parseExprPrimary() {
+  if (!consumeIf('L'))
+    return nullptr;
+  switch (look()) {
+  case 'w':
+    ++First;
+    return parseIntegerLiteral("wchar_t");
+  case 'b':
+    if (consumeIf("b0E"))
+      return make<BoolExpr>(0);
+    if (consumeIf("b1E"))
+      return make<BoolExpr>(1);
+    return nullptr;
+  case 'c':
+    ++First;
+    return parseIntegerLiteral("char");
+  case 'a':
+    ++First;
+    return parseIntegerLiteral("signed char");
+  case 'h':
+    ++First;
+    return parseIntegerLiteral("unsigned char");
+  case 's':
+    ++First;
+    return parseIntegerLiteral("short");
+  case 't':
+    ++First;
+    return parseIntegerLiteral("unsigned short");
+  case 'i':
+    ++First;
+    return parseIntegerLiteral("");
+  case 'j':
+    ++First;
+    return parseIntegerLiteral("u");
+  case 'l':
+    ++First;
+    return parseIntegerLiteral("l");
+  case 'm':
+    ++First;
+    return parseIntegerLiteral("ul");
+  case 'x':
+    ++First;
+    return parseIntegerLiteral("ll");
+  case 'y':
+    ++First;
+    return parseIntegerLiteral("ull");
+  case 'n':
+    ++First;
+    return parseIntegerLiteral("__int128");
+  case 'o':
+    ++First;
+    return parseIntegerLiteral("unsigned __int128");
+  case 'f':
+    ++First;
+    return parseFloatingLiteral<float>();
+  case 'd':
+    ++First;
+    return parseFloatingLiteral<double>();
+  case 'e':
+    ++First;
+    return parseFloatingLiteral<long double>();
+  case '_':
+    if (consumeIf("_Z")) {
+      Node *R = legacyParse<parse_encoding>();
+      if (R != nullptr && consumeIf('E'))
+        return R;
     }
-};
+    return nullptr;
+  case 'T':
+    // Invalid mangled name per
+    //   http://sourcerytools.com/pipermail/cxx-abi-dev/2011-August/002422.html
+    return nullptr;
+  default: {
+    // might be named type
+    Node *T = legacyParse<parse_type>();
+    if (T == nullptr)
+      return nullptr;
+    StringView N = parseNumber();
+    if (!N.empty()) {
+      if (!consumeIf('E'))
+        return nullptr;
+      return make<IntegerCastExpr>(T, N);
+    }
+    if (consumeIf('E'))
+      return T;
+    return nullptr;
+  }
+  }
+}
 
-const char* parse_type(const char* first, const char* last, Db& db);
-const char* parse_encoding(const char* first, const char* last, Db& db);
-const char* parse_name(const char* first, const char* last, Db& db,
-                       bool* ends_with_template_args = 0);
-const char* parse_expression(const char* first, const char* last, Db& db);
-const char* parse_template_args(const char* first, const char* last, Db& db);
-const char* parse_operator_name(const char* first, const char* last, Db& db);
-const char* parse_unqualified_name(const char* first, const char* last, Db& db);
-const char* parse_decltype(const char* first, const char* last, Db& db);
+// <expression> ::= <unary operator-name> <expression>
+//              ::= <binary operator-name> <expression> <expression>
+//              ::= <ternary operator-name> <expression> <expression> <expression>
+//              ::= cl <expression>+ E                                   # call
+//              ::= cv <type> <expression>                               # conversion with one argument
+//              ::= cv <type> _ <expression>* E                          # conversion with a different number of arguments
+//              ::= [gs] nw <expression>* _ <type> E                     # new (expr-list) type
+//              ::= [gs] nw <expression>* _ <type> <initializer>         # new (expr-list) type (init)
+//              ::= [gs] na <expression>* _ <type> E                     # new[] (expr-list) type
+//              ::= [gs] na <expression>* _ <type> <initializer>         # new[] (expr-list) type (init)
+//              ::= [gs] dl <expression>                                 # delete expression
+//              ::= [gs] da <expression>                                 # delete[] expression
+//              ::= pp_ <expression>                                     # prefix ++
+//              ::= mm_ <expression>                                     # prefix --
+//              ::= ti <type>                                            # typeid (type)
+//              ::= te <expression>                                      # typeid (expression)
+//              ::= dc <type> <expression>                               # dynamic_cast<type> (expression)
+//              ::= sc <type> <expression>                               # static_cast<type> (expression)
+//              ::= cc <type> <expression>                               # const_cast<type> (expression)
+//              ::= rc <type> <expression>                               # reinterpret_cast<type> (expression)
+//              ::= st <type>                                            # sizeof (a type)
+//              ::= sz <expression>                                      # sizeof (an expression)
+//              ::= at <type>                                            # alignof (a type)
+//              ::= az <expression>                                      # alignof (an expression)
+//              ::= nx <expression>                                      # noexcept (expression)
+//              ::= <template-param>
+//              ::= <function-param>
+//              ::= dt <expression> <unresolved-name>                    # expr.name
+//              ::= pt <expression> <unresolved-name>                    # expr->name
+//              ::= ds <expression> <expression>                         # expr.*expr
+//              ::= sZ <template-param>                                  # size of a parameter pack
+//              ::= sZ <function-param>                                  # size of a function parameter pack
+//              ::= sp <expression>                                      # pack expansion
+//              ::= tw <expression>                                      # throw expression
+//              ::= tr                                                   # throw with no operand (rethrow)
+//              ::= <unresolved-name>                                    # f(p), N::f(p), ::f(p),
+//                                                                       # freestanding dependent name (e.g., T::x),
+//                                                                       # objectless nonstatic member reference
+//              ::= fL <binary-operator-name> <expression> <expression>
+//              ::= fR <binary-operator-name> <expression> <expression>
+//              ::= fl <binary-operator-name> <expression>
+//              ::= fr <binary-operator-name> <expression>
+//              ::= <expr-primary>
+Node *Db::parseExpr() {
+  bool Global = consumeIf("gs");
+  if (numLeft() < 2)
+    return nullptr;
+
+  switch (*First) {
+  case 'L':
+    return parseExprPrimary();
+  case 'T':
+    return legacyParse<parse_template_param>();
+  case 'f':
+    return parseFunctionParam();
+  case 'a':
+    switch (First[1]) {
+    case 'a':
+      First += 2;
+      return parseBinaryExpr("&&");
+    case 'd':
+      First += 2;
+      return parsePrefixExpr("&");
+    case 'n':
+      First += 2;
+      return parseBinaryExpr("&");
+    case 'N':
+      First += 2;
+      return parseBinaryExpr("&=");
+    case 'S':
+      First += 2;
+      return parseBinaryExpr("=");
+    case 't': {
+      First += 2;
+      Node *Ty = legacyParse<parse_type>();
+      if (Ty == nullptr)
+        return nullptr;
+      return make<EnclosingExpr>("alignof (", Ty, ")");
+    }
+    case 'z': {
+      First += 2;
+      Node *Ty = parseExpr();
+      if (Ty == nullptr)
+        return nullptr;
+      return make<EnclosingExpr>("alignof (", Ty, ")");
+    }
+    }
+    return nullptr;
+  case 'c':
+    switch (First[1]) {
+    // cc <type> <expression>                               # const_cast<type>(expression)
+    case 'c': {
+      First += 2;
+      Node *Ty = legacyParse<parse_type>();
+      if (Ty == nullptr)
+        return Ty;
+      Node *Ex = parseExpr();
+      if (Ex == nullptr)
+        return Ex;
+      return make<CastExpr>("const_cast", Ty, Ex);
+    }
+    // cl <expression>+ E                                   # call
+    case 'l': {
+      First += 2;
+      Node *Callee = parseExpr();
+      if (Callee == nullptr)
+        return Callee;
+      size_t ExprsBegin = Names.size();
+      while (!consumeIf('E')) {
+        Node *E = parseExpr();
+        if (E == nullptr)
+          return E;
+        Names.push_back(E);
+      }
+      return make<CallExpr>(Callee, popTrailingNodeArray(ExprsBegin));
+    }
+    case 'm':
+      First += 2;
+      return parseBinaryExpr(",");
+    case 'o':
+      First += 2;
+      return parsePrefixExpr("~");
+    case 'v':
+      return parseConversionExpr();
+    }
+    return nullptr;
+  case 'd':
+    switch (First[1]) {
+    case 'a': {
+      First += 2;
+      Node *Ex = parseExpr();
+      if (Ex == nullptr)
+        return Ex;
+      return make<DeleteExpr>(Ex, Global, /*is_array=*/true);
+    }
+    case 'c': {
+      First += 2;
+      Node *T = legacyParse<parse_type>();
+      if (T == nullptr)
+        return T;
+      Node *Ex = parseExpr();
+      if (Ex == nullptr)
+        return Ex;
+      return make<CastExpr>("dynamic_cast", T, Ex);
+    }
+    case 'e':
+      First += 2;
+      return parsePrefixExpr("*");
+    case 'l': {
+      First += 2;
+      Node *E = parseExpr();
+      if (E == nullptr)
+        return E;
+      return make<DeleteExpr>(E, Global, /*is_array=*/false);
+    }
+    case 'n':
+      return legacyParse<parse_unresolved_name>();
+    case 's': {
+      First += 2;
+      Node *LHS = parseExpr();
+      if (LHS == nullptr)
+        return nullptr;
+      Node *RHS = parseExpr();
+      if (RHS == nullptr)
+        return nullptr;
+      return make<MemberExpr>(LHS, ".*", RHS);
+    }
+    case 't': {
+      First += 2;
+      Node *LHS = parseExpr();
+      if (LHS == nullptr)
+        return LHS;
+      Node *RHS = parseExpr();
+      if (RHS == nullptr)
+        return nullptr;
+      return make<MemberExpr>(LHS, ".", RHS);
+    }
+    case 'v':
+      First += 2;
+      return parseBinaryExpr("/");
+    case 'V':
+      First += 2;
+      return parseBinaryExpr("/=");
+    }
+    return nullptr;
+  case 'e':
+    switch (First[1]) {
+    case 'o':
+      First += 2;
+      return parseBinaryExpr("^");
+    case 'O':
+      First += 2;
+      return parseBinaryExpr("^=");
+    case 'q':
+      First += 2;
+      return parseBinaryExpr("==");
+    }
+    return nullptr;
+  case 'g':
+    switch (First[1]) {
+    case 'e':
+      First += 2;
+      return parseBinaryExpr(">=");
+    case 't':
+      First += 2;
+      return parseBinaryExpr(">");
+    }
+    return nullptr;
+  case 'i':
+    if (First[1] == 'x') {
+      First += 2;
+      Node *Base = parseExpr();
+      if (Base == nullptr)
+        return nullptr;
+      Node *Index = parseExpr();
+      if (Index == nullptr)
+        return Index;
+      return make<ArraySubscriptExpr>(Base, Index);
+    }
+    return nullptr;
+  case 'l':
+    switch (First[1]) {
+    case 'e':
+      First += 2;
+      return parseBinaryExpr("<=");
+    case 's':
+      First += 2;
+      return parseBinaryExpr("<<");
+    case 'S':
+      First += 2;
+      return parseBinaryExpr("<<=");
+    case 't':
+      First += 2;
+      return parseBinaryExpr("<");
+    }
+    return nullptr;
+  case 'm':
+    switch (First[1]) {
+    case 'i':
+      First += 2;
+      return parseBinaryExpr("-");
+    case 'I':
+      First += 2;
+      return parseBinaryExpr("-=");
+    case 'l':
+      First += 2;
+      return parseBinaryExpr("*");
+    case 'L':
+      First += 2;
+      return parseBinaryExpr("*=");
+    case 'm':
+      First += 2;
+      if (consumeIf('_'))
+        return parsePrefixExpr("--");
+      Node *Ex = parseExpr();
+      if (Ex == nullptr)
+        return nullptr;
+      return make<PostfixExpr>(Ex, "--");
+    }
+    return nullptr;
+  case 'n':
+    switch (First[1]) {
+    case 'a':
+    case 'w':
+      return parseNewExpr();
+    case 'e':
+      First += 2;
+      return parseBinaryExpr("!=");
+    case 'g':
+      First += 2;
+      return parsePrefixExpr("-");
+    case 't':
+      First += 2;
+      return parsePrefixExpr("!");
+    case 'x':
+      First += 2;
+      Node *Ex = parseExpr();
+      if (Ex == nullptr)
+        return Ex;
+      return make<EnclosingExpr>("noexcept (", Ex, ")");
+    }
+    return nullptr;
+  case 'o':
+    switch (First[1]) {
+    case 'n':
+      return legacyParse<parse_unresolved_name>();
+    case 'o':
+      First += 2;
+      return parseBinaryExpr("||");
+    case 'r':
+      First += 2;
+      return parseBinaryExpr("|");
+    case 'R':
+      First += 2;
+      return parseBinaryExpr("|=");
+    }
+    return nullptr;
+  case 'p':
+    switch (First[1]) {
+    case 'm':
+      First += 2;
+      return parseBinaryExpr("->*");
+    case 'l':
+      First += 2;
+      return parseBinaryExpr("+");
+    case 'L':
+      First += 2;
+      return parseBinaryExpr("+=");
+    case 'p': {
+      First += 2;
+      if (consumeIf('_'))
+        return parsePrefixExpr("++");
+      Node *Ex = parseExpr();
+      if (Ex == nullptr)
+        return Ex;
+      return make<PostfixExpr>(Ex, "++");
+    }
+    case 's':
+      First += 2;
+      return parsePrefixExpr("+");
+    case 't': {
+      First += 2;
+      Node *L = parseExpr();
+      if (L == nullptr)
+        return nullptr;
+      Node *R = parseExpr();
+      if (R == nullptr)
+        return nullptr;
+      return make<MemberExpr>(L, "->", R);
+    }
+    }
+    return nullptr;
+  case 'q':
+    if (First[1] == 'u') {
+      First += 2;
+      Node *Cond = parseExpr();
+      Node *LHS = parseExpr();
+      Node *RHS = parseExpr();
+      if (Cond && LHS && RHS)
+        return make<ConditionalExpr>(Cond, LHS, RHS);
+    }
+    return nullptr;
+  case 'r':
+    switch (First[1]) {
+    case 'c': {
+      First += 2;
+      Node *T = legacyParse<parse_type>();
+      if (T == nullptr)
+        return T;
+      Node *Ex = parseExpr();
+      if (Ex == nullptr)
+        return Ex;
+      return make<CastExpr>("reinterpret_cast", T, Ex);
+    }
+    case 'm':
+      First += 2;
+      return parseBinaryExpr("%");
+    case 'M':
+      First += 2;
+      return parseBinaryExpr("%=");
+    case 's':
+      First += 2;
+      return parseBinaryExpr(">>");
+    case 'S':
+      First += 2;
+      return parseBinaryExpr(">>=");
+    }
+    return nullptr;
+  case 's':
+    switch (First[1]) {
+    case 'c': {
+      First += 2;
+      Node *T = legacyParse<parse_type>();
+      if (T == nullptr)
+        return T;
+      Node *Ex = parseExpr();
+      if (Ex == nullptr)
+        return Ex;
+      return make<CastExpr>("static_cast", T, Ex);
+    }
+    case 'p': {
+      First += 2;
+      Node *Child = parseExpr();
+      if (Child == nullptr)
+        return nullptr;
+      return make<ParameterPackExpansion>(Child);
+    }
+    case 'r':
+      return legacyParse<parse_unresolved_name>();
+    case 't': {
+      First += 2;
+      Node *Ty = legacyParse<parse_type>();
+      if (Ty == nullptr)
+        return Ty;
+      return make<EnclosingExpr>("sizeof (", Ty, ")");
+    }
+    case 'z': {
+      First += 2;
+      Node *Ex = parseExpr();
+      if (Ex == nullptr)
+        return Ex;
+      return make<EnclosingExpr>("sizeof (", Ex, ")");
+    }
+    case 'Z':
+      First += 2;
+      if (look() == 'T') {
+        Node *R = legacyParse<parse_template_param>();
+        if (R == nullptr)
+          return nullptr;
+        return make<SizeofParamPackExpr>(R);
+      } else if (look() == 'f') {
+        Node *FP = parseFunctionParam();
+        if (FP == nullptr)
+          return nullptr;
+        return make<EnclosingExpr>("sizeof...", FP, ")");
+      }
+      return nullptr;
+    }
+    return nullptr;
+  case 't':
+    switch (First[1]) {
+    case 'e': {
+      First += 2;
+      Node *Ex = parseExpr();
+      if (Ex == nullptr)
+        return Ex;
+      return make<EnclosingExpr>("typeid (", Ex, ")");
+    }
+    case 'i': {
+      First += 2;
+      Node *Ty = legacyParse<parse_type>();
+      if (Ty == nullptr)
+        return Ty;
+      return make<EnclosingExpr>("typeid (", Ty, ")");
+    }
+    case 'r':
+      First += 2;
+      return make<NameType>("throw");
+    case 'w': {
+      First += 2;
+      Node *Ex = parseExpr();
+      if (Ex == nullptr)
+        return nullptr;
+      return make<ThrowExpr>(Ex);
+    }
+    }
+    return nullptr;
+  case '1':
+  case '2':
+  case '3':
+  case '4':
+  case '5':
+  case '6':
+  case '7':
+  case '8':
+  case '9':
+    return legacyParse<parse_unresolved_name>();
+  }
+  return nullptr;
+}
 
 // <number> ::= [n] <non-negative decimal integer>
 
@@ -1789,32 +2776,23 @@ struct FloatData<long double>
     static const size_t mangled_size = 20;  // May need to be adjusted to 16 or 24 on other platforms
 #endif
     static const size_t max_demangled_size = 40;
-    static constexpr const char* spec = "%LaL";
+    static constexpr const char *spec = "%LaL";
 };
 
-constexpr const char* FloatData<long double>::spec;
+constexpr const char *FloatData<long double>::spec;
 
-template <class Float>
-const char*
-parse_floating_number(const char* first, const char* last, Db& db)
-{
-    const size_t N = FloatData<Float>::mangled_size;
-    if (static_cast<std::size_t>(last - first) <= N)
-        return first;
-    last = first + N;
-    const char* t = first;
-    for (; t != last; ++t)
-    {
-        if (!isxdigit(*t))
-            return first;
-    }
-    if (*t == 'E')
-    {
-        db.Names.push_back(
-            db.make<FloatExpr<Float>>(StringView(first, t)));
-        first = t + 1;
-    }
-    return first;
+template <class Float> Node *Db::parseFloatingLiteral() {
+  const size_t N = FloatData<Float>::mangled_size;
+  if (numLeft() <= N)
+    return nullptr;
+  StringView Data(First, First + N);
+  for (char C : Data)
+    if (!std::isxdigit(C))
+      return nullptr;
+  First += N;
+  if (!consumeIf('E'))
+    return nullptr;
+  return make<FloatExpr<Float>>(Data);
 }
 
 // <positive length number> ::= [0-9]*
@@ -1938,8 +2916,7 @@ parse_substitution(const char* first, const char* last, Db& db)
             case '_':
                 if (!db.Subs.empty())
                 {
-                    for (Node* n : db.Subs.nthSubstitution(0))
-                        db.Names.push_back(n);
+                    db.Names.push_back(db.Subs[0]);
                     first += 2;
                 }
                 break;
@@ -1965,8 +2942,7 @@ parse_substitution(const char* first, const char* last, Db& db)
                     ++sub;
                     if (sub < db.Subs.size())
                     {
-                        for (Node* n : db.Subs.nthSubstitution(sub))
-                            db.Names.push_back(n);
+                        db.Names.push_back(db.Subs[sub]);
                         first = t+1;
                     }
                 }
@@ -2197,8 +3173,7 @@ parse_template_param(const char* first, const char* last, Db& db)
             {
                 if (!db.TemplateParams.empty())
                 {
-                    for (Node *t : db.TemplateParams.nthSubstitution(0))
-                        db.Names.push_back(t);
+                    db.Names.push_back(db.TemplateParams[0]);
                     first += 2;
                 }
                 else
@@ -2222,8 +3197,7 @@ parse_template_param(const char* first, const char* last, Db& db)
                 ++sub;
                 if (sub < db.TemplateParams.size())
                 {
-                    for (Node *temp : db.TemplateParams.nthSubstitution(sub))
-                        db.Names.push_back(temp);
+                    db.Names.push_back(db.TemplateParams[sub]);
                     first = t+1;
                 }
                 else
@@ -2233,324 +3207,6 @@ parse_template_param(const char* first, const char* last, Db& db)
                     first = t+1;
                     db.FixForwardReferences = true;
                 }
-            }
-        }
-    }
-    return first;
-}
-
-// cc <type> <expression>                               # const_cast<type> (expression)
-
-const char*
-parse_const_cast_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 'c' && first[1] == 'c')
-    {
-        const char* t = parse_type(first+2, last, db);
-        if (t != first+2)
-        {
-            const char* t1 = parse_expression(t, last, db);
-            if (t1 != t)
-            {
-                if (db.Names.size() < 2)
-                    return first;
-                auto from_expr = db.Names.back();
-                db.Names.pop_back();
-                if (db.Names.empty())
-                    return first;
-                db.Names.back() = db.make<CastExpr>(
-                    "const_cast", db.Names.back(), from_expr);
-                first = t1;
-            }
-        }
-    }
-    return first;
-}
-
-// dc <type> <expression>                               # dynamic_cast<type> (expression)
-
-const char*
-parse_dynamic_cast_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 'd' && first[1] == 'c')
-    {
-        const char* t = parse_type(first+2, last, db);
-        if (t != first+2)
-        {
-            const char* t1 = parse_expression(t, last, db);
-            if (t1 != t)
-            {
-                if (db.Names.size() < 2)
-                    return first;
-                auto from_expr = db.Names.back();
-                db.Names.pop_back();
-                if (db.Names.empty())
-                    return first;
-                db.Names.back() = db.make<CastExpr>(
-                    "dynamic_cast", db.Names.back(), from_expr);
-                first = t1;
-            }
-        }
-    }
-    return first;
-}
-
-// rc <type> <expression>                               # reinterpret_cast<type> (expression)
-
-const char*
-parse_reinterpret_cast_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 'r' && first[1] == 'c')
-    {
-        const char* t = parse_type(first+2, last, db);
-        if (t != first+2)
-        {
-            const char* t1 = parse_expression(t, last, db);
-            if (t1 != t)
-            {
-                if (db.Names.size() < 2)
-                    return first;
-                auto from_expr = db.Names.back();
-                db.Names.pop_back();
-                if (db.Names.empty())
-                    return first;
-                db.Names.back() = db.make<CastExpr>(
-                    "reinterpret_cast", db.Names.back(), from_expr);
-                first = t1;
-            }
-        }
-    }
-    return first;
-}
-
-// sc <type> <expression>                               # static_cast<type> (expression)
-
-const char*
-parse_static_cast_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 's' && first[1] == 'c')
-    {
-        const char* t = parse_type(first+2, last, db);
-        if (t != first+2)
-        {
-            const char* t1 = parse_expression(t, last, db);
-            if (t1 != t)
-            {
-                if (db.Names.size() < 2)
-                    return first;
-                auto from_expr = db.Names.back();
-                db.Names.pop_back();
-                db.Names.back() = db.make<CastExpr>(
-                    "static_cast", db.Names.back(), from_expr);
-                first = t1;
-            }
-        }
-    }
-    return first;
-}
-
-// sp <expression>                                  # pack expansion
-
-const char*
-parse_pack_expansion(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 's' && first[1] == 'p')
-    {
-        const char* t = parse_expression(first+2, last, db);
-        if (t != first+2)
-            first = t;
-    }
-    return first;
-}
-
-// st <type>                                            # sizeof (a type)
-
-const char*
-parse_sizeof_type_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 's' && first[1] == 't')
-    {
-        const char* t = parse_type(first+2, last, db);
-        if (t != first+2)
-        {
-            if (db.Names.empty())
-                return first;
-            db.Names.back() = db.make<EnclosingExpr>(
-                "sizeof (", db.Names.back(), ")");
-            first = t;
-        }
-    }
-    return first;
-}
-
-// sz <expr>                                            # sizeof (a expression)
-
-const char*
-parse_sizeof_expr_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 's' && first[1] == 'z')
-    {
-        const char* t = parse_expression(first+2, last, db);
-        if (t != first+2)
-        {
-            if (db.Names.empty())
-                return first;
-            db.Names.back() = db.make<EnclosingExpr>(
-                "sizeof (", db.Names.back(), ")");
-            first = t;
-        }
-    }
-    return first;
-}
-
-// sZ <template-param>                                  # size of a parameter pack
-
-const char*
-parse_sizeof_param_pack_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 's' && first[1] == 'Z' && first[2] == 'T')
-    {
-        size_t k0 = db.Names.size();
-        const char* t = parse_template_param(first+2, last, db);
-        size_t k1 = db.Names.size();
-        if (t != first+2 && k0 <= k1)
-        {
-            Node* sizeof_expr = db.make<SizeofParamPackExpr>(
-                db.popTrailingNodeArray(k0));
-            db.Names.push_back(sizeof_expr);
-            first = t;
-        }
-    }
-    return first;
-}
-
-// <function-param> ::= fp <top-level CV-Qualifiers> _                                     # L == 0, first parameter
-//                  ::= fp <top-level CV-Qualifiers> <parameter-2 non-negative number> _   # L == 0, second and later parameters
-//                  ::= fL <L-1 non-negative number> p <top-level CV-Qualifiers> _         # L > 0, first parameter
-//                  ::= fL <L-1 non-negative number> p <top-level CV-Qualifiers> <parameter-2 non-negative number> _   # L > 0, second and later parameters
-
-const char*
-parse_function_param(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && *first == 'f')
-    {
-        if (first[1] == 'p')
-        {
-            Qualifiers cv;
-            const char* t = parse_cv_qualifiers(first+2, last, cv);
-            const char* t1 = parse_number(t, last);
-            if (t1 != last && *t1 == '_')
-            {
-                db.Names.push_back(
-                    db.make<FunctionParam>(StringView(t, t1)));
-                first = t1+1;
-            }
-        }
-        else if (first[1] == 'L')
-        {
-            Qualifiers cv;
-            const char* t0 = parse_number(first+2, last);
-            if (t0 != last && *t0 == 'p')
-            {
-                ++t0;
-                const char* t = parse_cv_qualifiers(t0, last, cv);
-                const char* t1 = parse_number(t, last);
-                if (t1 != last && *t1 == '_')
-                {
-                    db.Names.push_back(
-                        db.make<FunctionParam>(StringView(t, t1)));
-                    first = t1+1;
-                }
-            }
-        }
-    }
-    return first;
-}
-
-// sZ <function-param>                                  # size of a function parameter pack
-
-const char*
-parse_sizeof_function_param_pack_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 's' && first[1] == 'Z' && first[2] == 'f')
-    {
-        const char* t = parse_function_param(first+2, last, db);
-        if (t != first+2)
-        {
-            if (db.Names.empty())
-                return first;
-            db.Names.back() = db.make<EnclosingExpr>(
-                "sizeof...(", db.Names.back(), ")");
-            first = t;
-        }
-    }
-    return first;
-}
-
-// te <expression>                                      # typeid (expression)
-// ti <type>                                            # typeid (type)
-
-const char*
-parse_typeid_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 't' && (first[1] == 'e' || first[1] == 'i'))
-    {
-        const char* t;
-        if (first[1] == 'e')
-            t = parse_expression(first+2, last, db);
-        else
-            t = parse_type(first+2, last, db);
-        if (t != first+2)
-        {
-            if (db.Names.empty())
-                return first;
-            db.Names.back() = db.make<EnclosingExpr>(
-                "typeid(", db.Names.back(), ")");
-            first = t;
-        }
-    }
-    return first;
-}
-
-// tw <expression>                                      # throw expression
-
-const char*
-parse_throw_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 't' && first[1] == 'w')
-    {
-        const char* t = parse_expression(first+2, last, db);
-        if (t != first+2)
-        {
-            if (db.Names.empty())
-                return first;
-            db.Names.back() = db.make<ThrowExpr>(db.Names.back());
-            first = t;
-        }
-    }
-    return first;
-}
-
-// ds <expression> <expression>                         # expr.*expr
-
-const char*
-parse_dot_star_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 'd' && first[1] == 's')
-    {
-        const char* t = parse_expression(first+2, last, db);
-        if (t != first+2)
-        {
-            const char* t1 = parse_expression(t, last, db);
-            if (t1 != t)
-            {
-                if (db.Names.size() < 2)
-                    return first;
-                auto rhs_expr = db.Names.back();
-                db.Names.pop_back();
-                db.Names.back() = db.make<MemberExpr>(
-                    db.Names.back(), ".*", rhs_expr);
-                first = t1;
             }
         }
     }
@@ -2604,7 +3260,7 @@ parse_unresolved_type(const char* first, const char* last, Db& db)
             size_t k1 = db.Names.size();
             if (t != first && k1 == k0 + 1)
             {
-                db.Subs.pushSubstitution(db.Names.back());
+                db.Subs.push_back(db.Names.back());
                 first = t;
             }
             else
@@ -2620,7 +3276,7 @@ parse_unresolved_type(const char* first, const char* last, Db& db)
             {
                 if (db.Names.empty())
                     return first;
-                db.Subs.pushSubstitution(db.Names.back());
+                db.Subs.push_back(db.Names.back());
                 first = t;
             }
             break;
@@ -2639,7 +3295,7 @@ parse_unresolved_type(const char* first, const char* last, Db& db)
                             return first;
                         db.Names.back() =
                             db.make<StdQualifiedName>(db.Names.back());
-                        db.Subs.pushSubstitution(db.Names.back());
+                        db.Subs.push_back(db.Names.back());
                         first = t;
                     }
                 }
@@ -2909,219 +3565,6 @@ parse_unresolved_name(const char* first, const char* last, Db& db)
                         db.make<QualifiedName>(db.Names.back(), s);
                     first = t1;
                 }
-            }
-        }
-    }
-    return first;
-}
-
-// dt <expression> <unresolved-name>                    # expr.name
-
-const char*
-parse_dot_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 'd' && first[1] == 't')
-    {
-        const char* t = parse_expression(first+2, last, db);
-        if (t != first+2)
-        {
-            const char* t1 = parse_unresolved_name(t, last, db);
-            if (t1 != t)
-            {
-                if (db.Names.size() < 2)
-                    return first;
-                auto name = db.Names.back();
-                db.Names.pop_back();
-                if (db.Names.empty())
-                    return first;
-                db.Names.back() = db.make<MemberExpr>(db.Names.back(), ".", name);
-                first = t1;
-            }
-        }
-    }
-    return first;
-}
-
-// cl <expression>+ E                                   # call
-
-const char*
-parse_call_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 4 && first[0] == 'c' && first[1] == 'l')
-    {
-        const char* t = parse_expression(first+2, last, db);
-        if (t == last || t == first + 2 || db.Names.empty())
-            return first;
-        Node* callee = db.Names.back();
-        db.Names.pop_back();
-        size_t args_begin = db.Names.size();
-        while (*t != 'E')
-        {
-            const char* t1 = parse_expression(t, last, db);
-            if (t1 == last || t1 == t)
-                return first;
-            t = t1;
-        }
-        if (db.Names.size() < args_begin)
-            return first;
-        ++t;
-        CallExpr* the_call = db.make<CallExpr>(
-            callee, db.popTrailingNodeArray(args_begin));
-        db.Names.push_back(the_call);
-        first = t;
-    }
-    return first;
-}
-
-// [gs] nw <expression>* _ <type> E                     # new (expr-list) type
-// [gs] nw <expression>* _ <type> <initializer>         # new (expr-list) type (init)
-// [gs] na <expression>* _ <type> E                     # new[] (expr-list) type
-// [gs] na <expression>* _ <type> <initializer>         # new[] (expr-list) type (init)
-// <initializer> ::= pi <expression>* E                 # parenthesized initialization
-
-const char*
-parse_new_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 4)
-    {
-        const char* t = first;
-        bool parsed_gs = false;
-        if (t[0] == 'g' && t[1] == 's')
-        {
-            t += 2;
-            parsed_gs = true;
-        }
-        if (t[0] == 'n' && (t[1] == 'w' || t[1] == 'a'))
-        {
-            bool is_array = t[1] == 'a';
-            t += 2;
-            if (t == last)
-                return first;
-            size_t first_expr_in_list = db.Names.size();
-            NodeArray ExprList, init_list;
-            while (*t != '_')
-            {
-                const char* t1 = parse_expression(t, last, db);
-                if (t1 == t || t1 == last)
-                    return first;
-                t = t1;
-            }
-            if (first_expr_in_list > db.Names.size())
-                return first;
-            ExprList = db.popTrailingNodeArray(first_expr_in_list);
-            ++t;
-            const char* t1 = parse_type(t, last, db);
-            if (t1 == t || t1 == last)
-                return first;
-            t = t1;
-            bool has_init = false;
-            if (last - t >= 3 && t[0] == 'p' && t[1] == 'i')
-            {
-                t += 2;
-                has_init = true;
-                size_t init_list_begin = db.Names.size();
-                while (*t != 'E')
-                {
-                    t1 = parse_expression(t, last, db);
-                    if (t1 == t || t1 == last)
-                        return first;
-                    t = t1;
-                }
-                if (init_list_begin > db.Names.size())
-                    return first;
-                init_list = db.popTrailingNodeArray(init_list_begin);
-            }
-            if (*t != 'E' || db.Names.empty())
-                return first;
-            auto type = db.Names.back();
-            db.Names.pop_back();
-            db.Names.push_back(
-                db.make<NewExpr>(ExprList, type, init_list,
-                                  parsed_gs, is_array));
-            first = t+1;
-        }
-    }
-    return first;
-}
-
-// cv <type> <expression>                               # conversion with one argument
-// cv <type> _ <expression>* E                          # conversion with a different number of arguments
-
-const char*
-parse_conversion_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 'c' && first[1] == 'v')
-    {
-        bool TryToParseTemplateArgs = db.TryToParseTemplateArgs;
-        db.TryToParseTemplateArgs = false;
-        size_t type_begin = db.Names.size();
-        const char* t = parse_type(first+2, last, db);
-        db.TryToParseTemplateArgs = TryToParseTemplateArgs;
-        if (t != first+2 && t != last)
-        {
-            size_t expr_list_begin = db.Names.size();
-            if (*t != '_')
-            {
-                const char* t1 = parse_expression(t, last, db);
-                if (t1 == t)
-                    return first;
-                t = t1;
-            }
-            else
-            {
-                ++t;
-                if (t == last)
-                    return first;
-                if (*t != 'E')
-                {
-                    while (*t != 'E')
-                    {
-                        const char* t1 = parse_expression(t, last, db);
-                        if (t1 == t || t1 == last)
-                            return first;
-                        t = t1;
-                    }
-                }
-                ++t;
-            }
-            if (db.Names.size() < expr_list_begin ||
-                type_begin > expr_list_begin)
-                return first;
-            NodeArray expressions = db.makeNodeArray(
-                db.Names.begin() + (long)expr_list_begin, db.Names.end());
-            NodeArray types = db.makeNodeArray(
-                db.Names.begin() + (long)type_begin,
-                db.Names.begin() + (long)expr_list_begin);
-            auto* conv_expr = db.make<ConversionExpr>(
-                types, expressions);
-            db.Names.dropBack(type_begin);
-            db.Names.push_back(conv_expr);
-            first = t;
-        }
-    }
-    return first;
-}
-
-// pt <expression> <expression>                    # expr->name
-
-const char*
-parse_arrow_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 'p' && first[1] == 't')
-    {
-        const char* t = parse_expression(first+2, last, db);
-        if (t != first+2)
-        {
-            const char* t1 = parse_expression(t, last, db);
-            if (t1 != t)
-            {
-                if (db.Names.size() < 2)
-                    return first;
-                auto tmp = db.Names.back();
-                db.Names.pop_back();
-                db.Names.back() = db.make<MemberExpr>(
-                    db.Names.back(), "->", tmp);
-                first = t1;
             }
         }
     }
@@ -3444,23 +3887,20 @@ parse_type(const char* first, const char* last, Db& db)
                     size_t k0 = db.Names.size();
                     const char* t1 = parse_type(t, last, db);
                     size_t k1 = db.Names.size();
-                    if (t1 != t)
+                    if (t1 != t && k0 + 1 == k1)
                     {
                         if (is_function)
-                            db.Subs.popPack();
-                        db.Subs.pushPack();
-                        for (size_t k = k0; k < k1; ++k)
+                            db.Subs.pop_back();
+                        if (cv)
                         {
-                            if (cv) {
-                                if (is_function)
-                                    db.Names[k] = db.make<FunctionQualType>(
-                                        db.Names[k], cv);
-                                else
-                                    db.Names[k] =
-                                        db.make<QualType>(db.Names[k], cv);
-                            }
-                            db.Subs.pushSubstitutionIntoPack(db.Names[k]);
+                            if (is_function)
+                                db.Names.back() = db.make<FunctionQualType>(
+                                    db.Names.back(), cv);
+                            else
+                                db.Names.back() =
+                                    db.make<QualType>(db.Names.back(), cv);
                         }
+                        db.Subs.push_back(db.Names.back());
                         first = t1;
                     }
                 }
@@ -3484,7 +3924,7 @@ parse_type(const char* first, const char* last, Db& db)
                             if (db.Names.empty())
                                 return first;
                             first = t;
-                            db.Subs.pushSubstitution(db.Names.back());
+                            db.Subs.push_back(db.Names.back());
                         }
                         break;
                     case 'C':
@@ -3496,7 +3936,7 @@ parse_type(const char* first, const char* last, Db& db)
                             db.Names.back() = db.make<PostfixQualifiedType>(
                                 db.Names.back(), " complex");
                             first = t;
-                            db.Subs.pushSubstitution(db.Names.back());
+                            db.Subs.push_back(db.Names.back());
                         }
                         break;
                     case 'F':
@@ -3506,7 +3946,7 @@ parse_type(const char* first, const char* last, Db& db)
                             if (db.Names.empty())
                                 return first;
                             first = t;
-                            db.Subs.pushSubstitution(db.Names.back());
+                            db.Subs.push_back(db.Names.back());
                         }
                         break;
                     case 'G':
@@ -3518,7 +3958,7 @@ parse_type(const char* first, const char* last, Db& db)
                             db.Names.back() = db.make<PostfixQualifiedType>(
                                 db.Names.back(), " imaginary");
                             first = t;
-                            db.Subs.pushSubstitution(db.Names.back());
+                            db.Subs.push_back(db.Names.back());
                         }
                         break;
                     case 'M':
@@ -3528,7 +3968,7 @@ parse_type(const char* first, const char* last, Db& db)
                             if (db.Names.empty())
                                 return first;
                             first = t;
-                            db.Subs.pushSubstitution(db.Names.back());
+                            db.Subs.push_back(db.Names.back());
                         }
                         break;
                     case 'O':
@@ -3536,15 +3976,11 @@ parse_type(const char* first, const char* last, Db& db)
                         size_t k0 = db.Names.size();
                         t = parse_type(first+1, last, db);
                         size_t k1 = db.Names.size();
-                        if (t != first+1)
+                        if (t != first+1 && k0 + 1 == k1)
                         {
-                            db.Subs.pushPack();
-                            for (size_t k = k0; k < k1; ++k)
-                            {
-                                db.Names[k] =
-                                    db.make<RValueReferenceType>(db.Names[k]);
-                                db.Subs.pushSubstitutionIntoPack(db.Names[k]);
-                            }
+                            db.Names.back() =
+                                db.make<RValueReferenceType>(db.Names.back());
+                            db.Subs.push_back(db.Names.back());
                             first = t;
                         }
                         break;
@@ -3554,14 +3990,10 @@ parse_type(const char* first, const char* last, Db& db)
                         size_t k0 = db.Names.size();
                         t = parse_type(first+1, last, db);
                         size_t k1 = db.Names.size();
-                        if (t != first+1)
+                        if (t != first+1 && k0 + 1 == k1)
                         {
-                            db.Subs.pushPack();
-                            for (size_t k = k0; k < k1; ++k)
-                            {
-                                db.Names[k] = db.make<PointerType>(db.Names[k]);
-                                db.Subs.pushSubstitutionIntoPack(db.Names[k]);
-                            }
+                            db.Names.back() = db.make<PointerType>(db.Names.back());
+                            db.Subs.push_back(db.Names.back());
                             first = t;
                         }
                         break;
@@ -3571,15 +4003,11 @@ parse_type(const char* first, const char* last, Db& db)
                         size_t k0 = db.Names.size();
                         t = parse_type(first+1, last, db);
                         size_t k1 = db.Names.size();
-                        if (t != first+1)
+                        if (t != first+1 && k0 + 1 == k1)
                         {
-                            db.Subs.pushPack();
-                            for (size_t k = k0; k < k1; ++k)
-                            {
-                                db.Names[k] =
-                                    db.make<LValueReferenceType>(db.Names[k]);
-                                db.Subs.pushSubstitutionIntoPack(db.Names[k]);
-                            }
+                            db.Names.back() =
+                                db.make<LValueReferenceType>(db.Names.back());
+                            db.Subs.push_back(db.Names.back());
                             first = t;
                         }
                         break;
@@ -3589,11 +4017,9 @@ parse_type(const char* first, const char* last, Db& db)
                         size_t k0 = db.Names.size();
                         t = parse_template_param(first, last, db);
                         size_t k1 = db.Names.size();
-                        if (t != first)
+                        if (t != first && k0 + 1 == k1)
                         {
-                            db.Subs.pushPack();
-                            for (size_t k = k0; k < k1; ++k)
-                                db.Subs.pushSubstitutionIntoPack(db.Names[k]);
+                            db.Subs.push_back(db.Names.back());
                             if (db.TryToParseTemplateArgs && k1 == k0+1)
                             {
                                 const char* t1 = parse_template_args(t, last, db);
@@ -3604,7 +4030,7 @@ parse_type(const char* first, const char* last, Db& db)
                                     db.Names.back() = db.make<
                                         NameWithTemplateArgs>(
                                         db.Names.back(), args);
-                                    db.Subs.pushSubstitution(db.Names.back());
+                                    db.Subs.push_back(db.Names.back());
                                     t = t1;
                                 }
                             }
@@ -3644,7 +4070,7 @@ parse_type(const char* first, const char* last, Db& db)
                                             db.Names.push_back(db.make<VendorExtQualType>(type, proto));
                                         }
                                     }
-                                    db.Subs.pushSubstitution(db.Names.back());
+                                    db.Subs.push_back(db.Names.back());
                                     first = t2;
                                 }
                             }
@@ -3658,7 +4084,7 @@ parse_type(const char* first, const char* last, Db& db)
                             {
                                 if (db.Names.empty())
                                     return first;
-                                db.Subs.pushSubstitution(db.Names.back());
+                                db.Subs.push_back(db.Names.back());
                                 first = t;
                             }
                         }
@@ -3683,7 +4109,7 @@ parse_type(const char* first, const char* last, Db& db)
                                           NameWithTemplateArgs>(
                                               db.Names.back(), template_args);
                                         // Need to create substitution for <template-template-param> <template-args>
-                                        db.Subs.pushSubstitution(db.Names.back());
+                                        db.Subs.push_back(db.Names.back());
                                         first = t;
                                     }
                                 }
@@ -3700,11 +4126,12 @@ parse_type(const char* first, const char* last, Db& db)
                                 size_t k0 = db.Names.size();
                                 t = parse_type(first+2, last, db);
                                 size_t k1 = db.Names.size();
-                                if (t != first+2)
+                                if (t != first+2 && k0 + 1 == k1)
                                 {
-                                    db.Subs.pushPack();
-                                    for (size_t k = k0; k < k1; ++k)
-                                        db.Subs.pushSubstitutionIntoPack(db.Names[k]);
+                                    db.Names.back() =
+                                        db.make<ParameterPackExpansion>(
+                                            db.Names.back());
+                                    db.Subs.push_back(db.Names.back());
                                     first = t;
                                     return first;
                                 }
@@ -3717,7 +4144,7 @@ parse_type(const char* first, const char* last, Db& db)
                                 {
                                     if (db.Names.empty())
                                         return first;
-                                    db.Subs.pushSubstitution(db.Names.back());
+                                    db.Subs.push_back(db.Names.back());
                                     first = t;
                                     return first;
                                 }
@@ -3728,7 +4155,7 @@ parse_type(const char* first, const char* last, Db& db)
                                 {
                                     if (db.Names.empty())
                                         return first;
-                                    db.Subs.pushSubstitution(db.Names.back());
+                                    db.Subs.push_back(db.Names.back());
                                     first = t;
                                     return first;
                                 }
@@ -3751,7 +4178,7 @@ parse_type(const char* first, const char* last, Db& db)
                             {
                                 if (db.Names.empty())
                                     return first;
-                                db.Subs.pushSubstitution(db.Names.back());
+                                db.Subs.push_back(db.Names.back());
                                 first = t;
                             }
                         }
@@ -4124,213 +4551,6 @@ parse_operator_name(const char* first, const char* last, Db& db)
     return first;
 }
 
-const char*
-parse_integer_literal(const char* first, const char* last, StringView lit, Db& db)
-{
-    const char* t = parse_number(first, last);
-    if (t != first && t != last && *t == 'E')
-    {
-        db.Names.push_back(
-            db.make<IntegerExpr>(lit, StringView(first, t)));
-        first = t+1;
-    }
-    return first;
-}
-
-// <expr-primary> ::= L <type> <value number> E                          # integer literal
-//                ::= L <type> <value float> E                           # floating literal
-//                ::= L <string type> E                                  # string literal
-//                ::= L <nullptr type> E                                 # nullptr literal (i.e., "LDnE")
-//                ::= L <type> <real-part float> _ <imag-part float> E   # complex floating point literal (C 2000)
-//                ::= L <mangled-name> E                                 # external name
-
-const char*
-parse_expr_primary(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 4 && *first == 'L')
-    {
-        switch (first[1])
-        {
-        case 'w':
-            {
-            const char* t = parse_integer_literal(first+2, last, "wchar_t", db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-        case 'b':
-            if (first[3] == 'E')
-            {
-                switch (first[2])
-                {
-                case '0':
-                    db.Names.push_back(db.make<BoolExpr>(0));
-                    first += 4;
-                    break;
-                case '1':
-                    db.Names.push_back(db.make<BoolExpr>(1));
-                    first += 4;
-                    break;
-                }
-            }
-            break;
-        case 'c':
-            {
-            const char* t = parse_integer_literal(first+2, last, "char", db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-        case 'a':
-            {
-            const char* t = parse_integer_literal(first+2, last, "signed char", db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-        case 'h':
-            {
-            const char* t = parse_integer_literal(first+2, last, "unsigned char", db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-        case 's':
-            {
-            const char* t = parse_integer_literal(first+2, last, "short", db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-        case 't':
-            {
-            const char* t = parse_integer_literal(first+2, last, "unsigned short", db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-        case 'i':
-            {
-            const char* t = parse_integer_literal(first+2, last, "", db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-        case 'j':
-            {
-            const char* t = parse_integer_literal(first+2, last, "u", db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-        case 'l':
-            {
-            const char* t = parse_integer_literal(first+2, last, "l", db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-        case 'm':
-            {
-            const char* t = parse_integer_literal(first+2, last, "ul", db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-        case 'x':
-            {
-            const char* t = parse_integer_literal(first+2, last, "ll", db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-        case 'y':
-            {
-            const char* t = parse_integer_literal(first+2, last, "ull", db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-        case 'n':
-            {
-            const char* t = parse_integer_literal(first+2, last, "__int128", db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-        case 'o':
-            {
-            const char* t = parse_integer_literal(first+2, last, "unsigned __int128", db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-        case 'f':
-            {
-            const char* t = parse_floating_number<float>(first+2, last, db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-        case 'd':
-            {
-            const char* t = parse_floating_number<double>(first+2, last, db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-         case 'e':
-            {
-            const char* t = parse_floating_number<long double>(first+2, last, db);
-            if (t != first+2)
-                first = t;
-            }
-            break;
-        case '_':
-            if (first[2] == 'Z')
-            {
-                const char* t = parse_encoding(first+3, last, db);
-                if (t != first+3 && t != last && *t == 'E')
-                    first = t+1;
-            }
-            break;
-        case 'T':
-            // Invalid mangled name per
-            //   http://sourcerytools.com/pipermail/cxx-abi-dev/2011-August/002422.html
-            break;
-        default:
-            {
-                // might be named type
-                const char* t = parse_type(first+1, last, db);
-                if (t != first+1 && t != last)
-                {
-                    if (*t != 'E')
-                    {
-                        const char* n = t;
-                        for (; n != last && isdigit(*n); ++n)
-                            ;
-                        if (n != t && n != last && *n == 'E')
-                        {
-                            if (db.Names.empty())
-                                return first;
-                            db.Names.back() = db.make<IntegerCastExpr>(
-                                db.Names.back(), StringView(t, n));
-                            first = n+1;
-                            break;
-                        }
-                    }
-                    else
-                    {
-                        first = t+1;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    return first;
-}
-
 Node* maybe_change_special_sub_name(Node* inp, Db& db)
 {
     if (inp->K != Node::KSpecialSubstitution)
@@ -4569,637 +4789,11 @@ parse_unscoped_name(const char* first, const char* last, Db& db)
     return first;
 }
 
-// at <type>                                            # alignof (a type)
-
-const char*
-parse_alignof_type(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 'a' && first[1] == 't')
-    {
-        const char* t = parse_type(first+2, last, db);
-        if (t != first+2)
-        {
-            if (db.Names.empty())
-                return first;
-            db.Names.back() =
-                db.make<EnclosingExpr>("alignof (", db.Names.back(), ")");
-            first = t;
-        }
-    }
-    return first;
-}
-
-// az <expression>                                            # alignof (a expression)
-
-const char*
-parse_alignof_expr(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 3 && first[0] == 'a' && first[1] == 'z')
-    {
-        const char* t = parse_expression(first+2, last, db);
-        if (t != first+2)
-        {
-            if (db.Names.empty())
-                return first;
-            db.Names.back() =
-                db.make<EnclosingExpr>("alignof (", db.Names.back(), ")");
-            first = t;
-        }
-    }
-    return first;
-}
-
-const char*
-parse_noexcept_expression(const char* first, const char* last, Db& db)
-{
-    const char* t1 = parse_expression(first, last, db);
-    if (t1 != first)
-    {
-        if (db.Names.empty())
-            return first;
-        db.Names.back() =
-            db.make<EnclosingExpr>("noexcept (", db.Names.back(), ")");
-        first = t1;
-    }
-    return first;
-}
-
-const char*
-parse_prefix_expression(const char* first, const char* last, StringView op, Db& db)
-{
-    const char* t1 = parse_expression(first, last, db);
-    if (t1 != first)
-    {
-        if (db.Names.empty())
-            return first;
-        db.Names.back() = db.make<PrefixExpr>(op, db.Names.back());
-        first = t1;
-    }
-    return first;
-}
-
-const char*
-parse_binary_expression(const char* first, const char* last, StringView op, Db& db)
-{
-    const char* t1 = parse_expression(first, last, db);
-    if (t1 != first)
-    {
-        const char* t2 = parse_expression(t1, last, db);
-        if (t2 != t1)
-        {
-            if (db.Names.size() < 2)
-                return first;
-            auto op2 = db.Names.back();
-            db.Names.pop_back();
-            auto op1 = db.Names.back();
-            db.Names.back() = db.make<BinaryExpr>(op1, op, op2);
-            first = t2;
-        }
-    }
-    return first;
-}
-
-// <expression> ::= <unary operator-name> <expression>
-//              ::= <binary operator-name> <expression> <expression>
-//              ::= <ternary operator-name> <expression> <expression> <expression>
-//              ::= cl <expression>+ E                                   # call
-//              ::= cv <type> <expression>                               # conversion with one argument
-//              ::= cv <type> _ <expression>* E                          # conversion with a different number of arguments
-//              ::= [gs] nw <expression>* _ <type> E                     # new (expr-list) type
-//              ::= [gs] nw <expression>* _ <type> <initializer>         # new (expr-list) type (init)
-//              ::= [gs] na <expression>* _ <type> E                     # new[] (expr-list) type
-//              ::= [gs] na <expression>* _ <type> <initializer>         # new[] (expr-list) type (init)
-//              ::= [gs] dl <expression>                                 # delete expression
-//              ::= [gs] da <expression>                                 # delete[] expression
-//              ::= pp_ <expression>                                     # prefix ++
-//              ::= mm_ <expression>                                     # prefix --
-//              ::= ti <type>                                            # typeid (type)
-//              ::= te <expression>                                      # typeid (expression)
-//              ::= dc <type> <expression>                               # dynamic_cast<type> (expression)
-//              ::= sc <type> <expression>                               # static_cast<type> (expression)
-//              ::= cc <type> <expression>                               # const_cast<type> (expression)
-//              ::= rc <type> <expression>                               # reinterpret_cast<type> (expression)
-//              ::= st <type>                                            # sizeof (a type)
-//              ::= sz <expression>                                      # sizeof (an expression)
-//              ::= at <type>                                            # alignof (a type)
-//              ::= az <expression>                                      # alignof (an expression)
-//              ::= nx <expression>                                      # noexcept (expression)
-//              ::= <template-param>
-//              ::= <function-param>
-//              ::= dt <expression> <unresolved-name>                    # expr.name
-//              ::= pt <expression> <unresolved-name>                    # expr->name
-//              ::= ds <expression> <expression>                         # expr.*expr
-//              ::= sZ <template-param>                                  # size of a parameter pack
-//              ::= sZ <function-param>                                  # size of a function parameter pack
-//              ::= sp <expression>                                      # pack expansion
-//              ::= tw <expression>                                      # throw expression
-//              ::= tr                                                   # throw with no operand (rethrow)
-//              ::= <unresolved-name>                                    # f(p), N::f(p), ::f(p),
-//                                                                       # freestanding dependent name (e.g., T::x),
-//                                                                       # objectless nonstatic member reference
-//              ::= <expr-primary>
-
-const char*
-parse_expression(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 2)
-    {
-        const char* t = first;
-        bool parsed_gs = false;
-        if (last - first >= 4 && t[0] == 'g' && t[1] == 's')
-        {
-            t += 2;
-            parsed_gs = true;
-        }
-        switch (*t)
-        {
-        case 'L':
-            first = parse_expr_primary(first, last, db);
-            break;
-        case 'T':
-            first = parse_template_param(first, last, db);
-            break;
-        case 'f':
-            first = parse_function_param(first, last, db);
-            break;
-        case 'a':
-            switch (t[1])
-            {
-            case 'a':
-                t = parse_binary_expression(first+2, last, "&&", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'd':
-                t = parse_prefix_expression(first+2, last, "&", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'n':
-                t = parse_binary_expression(first+2, last, "&", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'N':
-                t = parse_binary_expression(first+2, last, "&=", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'S':
-                t = parse_binary_expression(first+2, last, "=", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 't':
-                first = parse_alignof_type(first, last, db);
-                break;
-            case 'z':
-                first = parse_alignof_expr(first, last, db);
-                break;
-            }
-            break;
-        case 'c':
-            switch (t[1])
-            {
-            case 'c':
-                first = parse_const_cast_expr(first, last, db);
-                break;
-            case 'l':
-                first = parse_call_expr(first, last, db);
-                break;
-            case 'm':
-                t = parse_binary_expression(first+2, last, ",", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'o':
-                t = parse_prefix_expression(first+2, last, "~", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'v':
-                first = parse_conversion_expr(first, last, db);
-                break;
-            }
-            break;
-        case 'd':
-            switch (t[1])
-            {
-            case 'a':
-                {
-                    const char* t1 = parse_expression(t+2, last, db);
-                    if (t1 != t+2)
-                    {
-                        if (db.Names.empty())
-                            return first;
-                        db.Names.back() = db.make<DeleteExpr>(
-                            db.Names.back(), parsed_gs, /*is_array=*/true);
-                        first = t1;
-                    }
-                }
-                break;
-            case 'c':
-                first = parse_dynamic_cast_expr(first, last, db);
-                break;
-            case 'e':
-                t = parse_prefix_expression(first+2, last, "*", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'l':
-                {
-                    const char* t1 = parse_expression(t+2, last, db);
-                    if (t1 != t+2)
-                    {
-                        if (db.Names.empty())
-                            return first;
-                        db.Names.back() = db.make<DeleteExpr>(
-                            db.Names.back(), parsed_gs, /*is_array=*/false);
-                        first = t1;
-                    }
-                }
-                break;
-            case 'n':
-                return parse_unresolved_name(first, last, db);
-            case 's':
-                first = parse_dot_star_expr(first, last, db);
-                break;
-            case 't':
-                first = parse_dot_expr(first, last, db);
-                break;
-            case 'v':
-                t = parse_binary_expression(first+2, last, "/", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'V':
-                t = parse_binary_expression(first+2, last, "/=", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            }
-            break;
-        case 'e':
-            switch (t[1])
-            {
-            case 'o':
-                t = parse_binary_expression(first+2, last, "^", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'O':
-                t = parse_binary_expression(first+2, last, "^=", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'q':
-                t = parse_binary_expression(first+2, last, "==", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            }
-            break;
-        case 'g':
-            switch (t[1])
-            {
-            case 'e':
-                t = parse_binary_expression(first+2, last, ">=", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 't':
-                t = parse_binary_expression(first+2, last, ">", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            }
-            break;
-        case 'i':
-            if (t[1] == 'x')
-            {
-                const char* t1 = parse_expression(first+2, last, db);
-                if (t1 != first+2)
-                {
-                    const char* t2 = parse_expression(t1, last, db);
-                    if (t2 != t1)
-                    {
-                        if (db.Names.size() < 2)
-                            return first;
-                        auto op2 = db.Names.back();
-                        db.Names.pop_back();
-                        auto op1 = db.Names.back();
-                        db.Names.back() =
-                            db.make<ArraySubscriptExpr>(op1, op2);
-                        first = t2;
-                    }
-                    else if (!db.Names.empty())
-                        db.Names.pop_back();
-                }
-            }
-            break;
-        case 'l':
-            switch (t[1])
-            {
-            case 'e':
-                t = parse_binary_expression(first+2, last, "<=", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 's':
-                t = parse_binary_expression(first+2, last, "<<", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'S':
-                t = parse_binary_expression(first+2, last, "<<=", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 't':
-                t = parse_binary_expression(first+2, last, "<", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            }
-            break;
-        case 'm':
-            switch (t[1])
-            {
-            case 'i':
-                t = parse_binary_expression(first+2, last, "-", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'I':
-                t = parse_binary_expression(first+2, last, "-=", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'l':
-                t = parse_binary_expression(first+2, last, "*", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'L':
-                t = parse_binary_expression(first+2, last, "*=", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'm':
-                if (first+2 != last && first[2] == '_')
-                {
-                    t = parse_prefix_expression(first+3, last, "--", db);
-                    if (t != first+3)
-                        first = t;
-                }
-                else
-                {
-                    const char* t1 = parse_expression(first+2, last, db);
-                    if (t1 != first+2)
-                    {
-                        if (db.Names.empty())
-                            return first;
-                        db.Names.back() =
-                            db.make<PostfixExpr>(db.Names.back(), "--");
-                        first = t1;
-                    }
-                }
-                break;
-            }
-            break;
-        case 'n':
-            switch (t[1])
-            {
-            case 'a':
-            case 'w':
-                first = parse_new_expr(first, last, db);
-                break;
-            case 'e':
-                t = parse_binary_expression(first+2, last, "!=", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'g':
-                t = parse_prefix_expression(first+2, last, "-", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 't':
-                t = parse_prefix_expression(first+2, last, "!", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'x':
-                t = parse_noexcept_expression(first+2, last, db);
-                if (t != first+2)
-                    first = t;
-                break;
-            }
-            break;
-        case 'o':
-            switch (t[1])
-            {
-            case 'n':
-                return parse_unresolved_name(first, last, db);
-            case 'o':
-                t = parse_binary_expression(first+2, last, "||", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'r':
-                t = parse_binary_expression(first+2, last, "|", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'R':
-                t = parse_binary_expression(first+2, last, "|=", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            }
-            break;
-        case 'p':
-            switch (t[1])
-            {
-            case 'm':
-                t = parse_binary_expression(first+2, last, "->*", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'l':
-                t = parse_binary_expression(first+2, last, "+", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'L':
-                t = parse_binary_expression(first+2, last, "+=", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'p':
-                if (first+2 != last && first[2] == '_')
-                {
-                    t = parse_prefix_expression(first+3, last, "++", db);
-                    if (t != first+3)
-                        first = t;
-                }
-                else
-                {
-                    const char* t1 = parse_expression(first+2, last, db);
-                    if (t1 != first+2)
-                    {
-                        if (db.Names.empty())
-                            return first;
-                        db.Names.back() =
-                            db.make<PostfixExpr>(db.Names.back(), "++");
-                        first = t1;
-                    }
-                }
-                break;
-            case 's':
-                t = parse_prefix_expression(first+2, last, "+", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 't':
-                first = parse_arrow_expr(first, last, db);
-                break;
-            }
-            break;
-        case 'q':
-            if (t[1] == 'u')
-            {
-                const char* t1 = parse_expression(first+2, last, db);
-                if (t1 != first+2)
-                {
-                    const char* t2 = parse_expression(t1, last, db);
-                    if (t2 != t1)
-                    {
-                        const char* t3 = parse_expression(t2, last, db);
-                        if (t3 != t2)
-                        {
-                            if (db.Names.size() < 3)
-                                return first;
-                            auto op3 = db.Names.back();
-                            db.Names.pop_back();
-                            auto op2 = db.Names.back();
-                            db.Names.pop_back();
-                            auto op1 = db.Names.back();
-                            db.Names.back() =
-                                db.make<ConditionalExpr>(op1, op2, op3);
-                            first = t3;
-                        }
-                        else
-                        {
-                            if (db.Names.size() < 2)
-                              return first;
-                            db.Names.pop_back();
-                            db.Names.pop_back();
-                        }
-                    }
-                    else if (!db.Names.empty())
-                        db.Names.pop_back();
-                }
-            }
-            break;
-        case 'r':
-            switch (t[1])
-            {
-            case 'c':
-                first = parse_reinterpret_cast_expr(first, last, db);
-                break;
-            case 'm':
-                t = parse_binary_expression(first+2, last, "%", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'M':
-                t = parse_binary_expression(first+2, last, "%=", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 's':
-                t = parse_binary_expression(first+2, last, ">>", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            case 'S':
-                t = parse_binary_expression(first+2, last, ">>=", db);
-                if (t != first+2)
-                    first = t;
-                break;
-            }
-            break;
-        case 's':
-            switch (t[1])
-            {
-            case 'c':
-                first = parse_static_cast_expr(first, last, db);
-                break;
-            case 'p':
-                first = parse_pack_expansion(first, last, db);
-                break;
-            case 'r':
-                return parse_unresolved_name(first, last, db);
-            case 't':
-                first = parse_sizeof_type_expr(first, last, db);
-                break;
-            case 'z':
-                first = parse_sizeof_expr_expr(first, last, db);
-                break;
-            case 'Z':
-                if (last - t >= 3)
-                {
-                    switch (t[2])
-                    {
-                    case 'T':
-                        first = parse_sizeof_param_pack_expr(first, last, db);
-                        break;
-                    case 'f':
-                        first = parse_sizeof_function_param_pack_expr(first, last, db);
-                        break;
-                    }
-                }
-                break;
-            }
-            break;
-        case 't':
-            switch (t[1])
-            {
-            case 'e':
-            case 'i':
-                first = parse_typeid_expr(first, last, db);
-                break;
-            case 'r':
-                db.Names.push_back(db.make<NameType>("throw"));
-                first += 2;
-                break;
-            case 'w':
-                first = parse_throw_expr(first, last, db);
-                break;
-            }
-            break;
-        case '1':
-        case '2':
-        case '3':
-        case '4':
-        case '5':
-        case '6':
-        case '7':
-        case '8':
-        case '9':
-            return parse_unresolved_name(first, last, db);
-        }
-    }
-    return first;
-}
-
 // <template-arg> ::= <type>                                             # type or template
 //                ::= X <expression> E                                   # expression
 //                ::= <expr-primary>                                     # simple expressions
 //                ::= J <template-arg>* E                                # argument pack
 //                ::= LZ <encoding> E                                    # extension
-
 const char*
 parse_template_arg(const char* first, const char* last, Db& db)
 {
@@ -5216,10 +4810,11 @@ parse_template_arg(const char* first, const char* last, Db& db)
                     first = t+1;
             }
             break;
-        case 'J':
+        case 'J': {
             t = first+1;
             if (t == last)
                 return first;
+            size_t ArgsBegin = db.Names.size();
             while (*t != 'E')
             {
                 const char* t1 = parse_template_arg(t, last, db);
@@ -5227,8 +4822,11 @@ parse_template_arg(const char* first, const char* last, Db& db)
                     return first;
                 t = t1;
             }
+            NodeArray Args = db.popTrailingNodeArray(ArgsBegin);
+            db.Names.push_back(db.make<TemplateArgumentPack>(Args));
             first = t+1;
             break;
+        }
         case 'L':
             // <expr-primary> or LZ <encoding> E
             if (first+1 != last && first[1] == 'Z')
@@ -5251,7 +4849,6 @@ parse_template_arg(const char* first, const char* last, Db& db)
 
 // <template-args> ::= I <template-arg>* E
 //     extension, the abi says <template-arg>+
-
 const char*
 parse_template_args(const char* first, const char* last, Db& db)
 {
@@ -5270,12 +4867,14 @@ parse_template_args(const char* first, const char* last, Db& db)
                 const char* t1 = parse_template_arg(t, last, db);
                 size_t k1 = db.Names.size();
                 db.TemplateParams = std::move(TmpParams);
-
-                if (t1 == t || t1 == last || k0 > k1)
+                if (t1 == t || t1 == last || k0 + 1 != k1)
                     return first;
-                db.TemplateParams.pushPack();
-                for (size_t k = k0; k < k1; ++k)
-                    db.TemplateParams.pushSubstitutionIntoPack(db.Names[k]);
+                Node *TableEntry = db.Names.back();
+                if (TableEntry->getKind() == Node::KTemplateArgumentPack)
+                  TableEntry = db.make<ParameterPack>(
+                      static_cast<TemplateArgumentPack*>(TableEntry)
+                          ->getElements());
+                db.TemplateParams.push_back(TableEntry);
                 t = t1;
                 continue;
             }
@@ -5289,7 +4888,7 @@ parse_template_args(const char* first, const char* last, Db& db)
         if (begin_idx > db.Names.size())
             return first;
         first = t + 1;
-        TemplateParams* tp = db.make<TemplateParams>(
+        auto *tp = db.make<TemplateArgs>(
             db.popTrailingNodeArray(begin_idx));
         db.Names.push_back(tp);
     }
@@ -5363,7 +4962,7 @@ parse_nested_name(const char* first, const char* last, Db& db,
                     {
                         db.Names.back() = db.make<QualifiedName>(
                             db.Names.back(), name);
-                        db.Subs.pushSubstitution(db.Names.back());
+                        db.Subs.push_back(db.Names.back());
                     }
                     else
                         db.Names.back() = name;
@@ -5386,7 +4985,7 @@ parse_nested_name(const char* first, const char* last, Db& db,
                             db.make<QualifiedName>(db.Names.back(), name);
                     else
                         db.Names.back() = name;
-                    db.Subs.pushSubstitution(db.Names.back());
+                    db.Subs.push_back(db.Names.back());
                     pop_subs = true;
                     t0 = t1;
                 }
@@ -5408,7 +5007,7 @@ parse_nested_name(const char* first, const char* last, Db& db,
                             db.make<QualifiedName>(db.Names.back(), name);
                     else
                         db.Names.back() = name;
-                    db.Subs.pushSubstitution(db.Names.back());
+                    db.Subs.push_back(db.Names.back());
                     pop_subs = true;
                     t0 = t1;
                 }
@@ -5425,7 +5024,7 @@ parse_nested_name(const char* first, const char* last, Db& db,
                     db.Names.pop_back();
                     db.Names.back() = db.make<NameWithTemplateArgs>(
                         db.Names.back(), name);
-                    db.Subs.pushSubstitution(db.Names.back());
+                    db.Subs.push_back(db.Names.back());
                     t0 = t1;
                     component_ends_with_template_args = true;
                 }
@@ -5450,7 +5049,7 @@ parse_nested_name(const char* first, const char* last, Db& db,
                             db.make<QualifiedName>(db.Names.back(), name);
                     else
                         db.Names.back() = name;
-                    db.Subs.pushSubstitution(db.Names.back());
+                    db.Subs.push_back(db.Names.back());
                     pop_subs = true;
                     t0 = t1;
                 }
@@ -5461,7 +5060,7 @@ parse_nested_name(const char* first, const char* last, Db& db,
         first = t0 + 1;
         db.CV = cv;
         if (pop_subs && !db.Subs.empty())
-            db.Subs.popPack();
+            db.Subs.pop_back();
         if (ends_with_template_args)
             *ends_with_template_args = component_ends_with_template_args;
     }
@@ -5626,7 +5225,7 @@ parse_name(const char* first, const char* last, Db& db,
                 {
                     if (db.Names.empty())
                         return first;
-                    db.Subs.pushSubstitution(db.Names.back());
+                    db.Subs.push_back(db.Names.back());
                     t0 = t1;
                     t1 = parse_template_args(t0, last, db);
                     if (t1 != t0)
@@ -6013,7 +5612,7 @@ parse_encoding(const char* first, const char* last, Db& db)
                             return first;
                         Node* name = db.Names.back();
                         db.Names.pop_back();
-                        result = db.make<TopLevelFunctionDecl>(
+                        result = db.make<FunctionEncoding>(
                             return_type, name, NodeArray());
                     }
                     else
@@ -6034,7 +5633,7 @@ parse_encoding(const char* first, const char* last, Db& db)
                             return first;
                         Node* name = db.Names.back();
                         db.Names.pop_back();
-                        result = db.make<TopLevelFunctionDecl>(
+                        result = db.make<FunctionEncoding>(
                             return_type, name, params);
                     }
                     if (ref != FrefQualNone)
@@ -6111,12 +5710,19 @@ parse_dot_suffix(const char* first, const char* last, Db& db)
     return first;
 }
 
+enum {
+    unknown_error = -4,
+    invalid_args = -3,
+    invalid_mangled_name,
+    memory_alloc_failure,
+    success
+};
+
 // <block-involcaton-function> ___Z<encoding>_block_invoke
 // <block-involcaton-function> ___Z<encoding>_block_invoke<decimal-digit>+
 // <block-involcaton-function> ___Z<encoding>_block_invoke_<decimal-digit>+
 // <mangled-name> ::= _Z<encoding>
 //                ::= <type>
-
 void
 demangle(const char* first, const char* last, Db& db, int& status)
 {
@@ -6167,6 +5773,8 @@ demangle(const char* first, const char* last, Db& db, int& status)
 
 }  // unnamed namespace
 
+
+namespace __cxxabiv1 {
 extern "C" _LIBCXXABI_FUNC_VIS char *
 __cxa_demangle(const char *mangled_name, char *buf, size_t *n, int *status) {
     if (mangled_name == nullptr || (buf != nullptr && n == nullptr))
@@ -6195,6 +5803,10 @@ __cxa_demangle(const char *mangled_name, char *buf, size_t *n, int *status) {
             internal_status = invalid_mangled_name;
     }
 
+    if (internal_status == success &&
+        db.Names.back()->containsUnexpandedParameterPack())
+        internal_status = invalid_mangled_name;
+
     if (internal_status == success)
     {
         if (!buf)
@@ -6220,5 +5832,4 @@ __cxa_demangle(const char *mangled_name, char *buf, size_t *n, int *status) {
         *status = internal_status;
     return buf;
 }
-
 }  // __cxxabiv1
