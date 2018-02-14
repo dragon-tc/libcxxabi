@@ -165,6 +165,7 @@ public:
     KQualType,
     KConversionOperatorType,
     KPostfixQualifiedType,
+    KElaboratedTypeSpefType,
     KNameType,
     KAbiTagAttr,
     KObjCProtoName,
@@ -174,9 +175,9 @@ public:
     KPointerToMemberType,
     KArrayType,
     KFunctionType,
+    KNoexceptSpec,
+    KDynamicExceptionSpec,
     KFunctionEncoding,
-    KFunctionQualType,
-    KFunctionRefQualType,
     KLiteralOperator,
     KSpecialName,
     KCtorVtableSpecialName,
@@ -197,6 +198,8 @@ public:
     KUnnamedTypeName,
     KLambdaTypeName,
     KExpr,
+    KBracedExpr,
+    KBracedRangeExpr,
   };
 
   static constexpr unsigned NoParameterPack =
@@ -340,21 +343,24 @@ public:
 
 class VendorExtQualType final : public Node {
   const Node *Ty;
-  const Node *Ext;
+  StringView Ext;
 
 public:
-  VendorExtQualType(Node *Ty_, Node *Ext_)
-      : Node(KVendorExtQualType,
-             std::min(Ty_->ParameterPackSize, Ext_->ParameterPackSize)),
+  VendorExtQualType(Node *Ty_, StringView Ext_)
+      : Node(KVendorExtQualType, Ty_->ParameterPackSize),
         Ty(Ty_), Ext(Ext_) {}
-
-  const Node* getQual() const { return Ext; }
 
   void printLeft(OutputStream &S) const override {
     Ty->print(S);
     S += " ";
-    Ext->print(S);
+    S += Ext;
   }
+};
+
+enum FunctionRefQual : unsigned char {
+  FrefQualNone,
+  FrefQualLValue,
+  FrefQualRValue,
 };
 
 enum Qualifiers {
@@ -446,6 +452,22 @@ public:
   void printLeft(OutputStream &s) const override { s += Name; }
 };
 
+class ElaboratedTypeSpefType : public Node {
+  StringView Kind;
+  Node *Child;
+public:
+  ElaboratedTypeSpefType(StringView Kind_, Node *Child_)
+      : Node(KElaboratedTypeSpefType), Kind(Kind_), Child(Child_) {
+    ParameterPackSize = Child->ParameterPackSize;
+  }
+
+  void printLeft(OutputStream &S) const override {
+    S += Kind;
+    S += ' ';
+    Child->print(S);
+  }
+};
+
 class AbiTagAttr final : public Node {
   const Node* Base;
   StringView Tag;
@@ -465,12 +487,12 @@ public:
 
 class ObjCProtoName : public Node {
   Node *Ty;
-  Node *Protocol;
+  StringView Protocol;
 
   friend class PointerType;
 
 public:
-  ObjCProtoName(Node *Ty_, Node *Protocol_)
+  ObjCProtoName(Node *Ty_, StringView Protocol_)
       : Node(KObjCProtoName), Ty(Ty_), Protocol(Protocol_) {}
 
   bool isObjCObject() const {
@@ -481,7 +503,7 @@ public:
   void printLeft(OutputStream &S) const override {
     Ty->print(S);
     S += "<";
-    Protocol->print(S);
+    S += Protocol;
     S += ">";
   }
 };
@@ -512,7 +534,7 @@ public:
     } else {
       const auto *objcProto = static_cast<const ObjCProtoName *>(Pointee);
       s += "id<";
-      objcProto->Protocol->print(s);
+      s += objcProto->Protocol;
       s += ">";
     }
   }
@@ -698,15 +720,23 @@ public:
 class FunctionType final : public Node {
   Node *Ret;
   NodeArray Params;
+  Qualifiers CVQuals;
+  FunctionRefQual RefQual;
+  Node *ExceptionSpec;
 
 public:
-  FunctionType(Node *Ret_, NodeArray Params_)
+  FunctionType(Node *Ret_, NodeArray Params_, Qualifiers CVQuals_,
+               FunctionRefQual RefQual_, Node *ExceptionSpec_)
       : Node(KFunctionType, Ret_->ParameterPackSize,
              /*RHSComponentCache=*/Cache::Yes, /*ArrayCache=*/Cache::No,
              /*FunctionCache=*/Cache::Yes),
-        Ret(Ret_), Params(Params_) {
+        Ret(Ret_), Params(Params_), CVQuals(CVQuals_), RefQual(RefQual_),
+        ExceptionSpec(ExceptionSpec_) {
     for (Node *P : Params)
       ParameterPackSize = std::min(ParameterPackSize, P->ParameterPackSize);
+    if (ExceptionSpec != nullptr)
+      ParameterPackSize =
+        std::min(ParameterPackSize, ExceptionSpec->ParameterPackSize);
   }
 
   bool hasRHSComponentSlow(OutputStream &) const override { return true; }
@@ -729,6 +759,51 @@ public:
     Params.printWithComma(S);
     S += ")";
     Ret->printRight(S);
+
+    if (CVQuals & QualConst)
+      S += " const";
+    if (CVQuals & QualVolatile)
+      S += " volatile";
+    if (CVQuals & QualRestrict)
+      S += " restrict";
+
+    if (RefQual == FrefQualLValue)
+      S += " &";
+    else if (RefQual == FrefQualRValue)
+      S += " &&";
+
+    if (ExceptionSpec != nullptr) {
+      S += ' ';
+      ExceptionSpec->print(S);
+    }
+  }
+};
+
+class NoexceptSpec : public Node {
+  Node *E;
+public:
+  NoexceptSpec(Node *E_) : Node(KNoexceptSpec, E_->ParameterPackSize), E(E_) {}
+
+  void printLeft(OutputStream &S) const override {
+    S += "noexcept(";
+    E->print(S);
+    S += ")";
+  }
+};
+
+class DynamicExceptionSpec : public Node {
+  NodeArray Types;
+public:
+  DynamicExceptionSpec(NodeArray Types_)
+      : Node(KDynamicExceptionSpec), Types(Types_) {
+    for (Node *T : Types)
+      ParameterPackSize = std::min(ParameterPackSize, T->ParameterPackSize);
+  }
+
+  void printLeft(OutputStream &S) const override {
+    S += "throw(";
+    Types.printWithComma(S);
+    S += ')';
   }
 };
 
@@ -736,13 +811,17 @@ class FunctionEncoding final : public Node {
   const Node *Ret;
   const Node *Name;
   NodeArray Params;
+  Qualifiers CVQuals;
+  FunctionRefQual RefQual;
 
 public:
-  FunctionEncoding(Node *Ret_, Node *Name_, NodeArray Params_)
+  FunctionEncoding(Node *Ret_, Node *Name_, NodeArray Params_,
+                   Qualifiers CVQuals_, FunctionRefQual RefQual_)
       : Node(KFunctionEncoding, NoParameterPack,
              /*RHSComponentCache=*/Cache::Yes, /*ArrayCache=*/Cache::No,
              /*FunctionCache=*/Cache::Yes),
-        Ret(Ret_), Name(Name_), Params(Params_) {
+        Ret(Ret_), Name(Name_), Params(Params_), CVQuals(CVQuals_),
+        RefQual(RefQual_) {
     for (Node *P : Params)
       ParameterPackSize = std::min(ParameterPackSize, P->ParameterPackSize);
     if (Ret)
@@ -769,65 +848,18 @@ public:
     S += ")";
     if (Ret)
       Ret->printRight(S);
-  }
-};
 
-enum FunctionRefQual : unsigned char {
-  FrefQualNone,
-  FrefQualLValue,
-  FrefQualRValue,
-};
+    if (CVQuals & QualConst)
+      S += " const";
+    if (CVQuals & QualVolatile)
+      S += " volatile";
+    if (CVQuals & QualRestrict)
+      S += " restrict";
 
-class FunctionRefQualType : public Node {
-  Node *Fn;
-  FunctionRefQual Quals;
-
-  friend class FunctionQualType;
-
-public:
-  FunctionRefQualType(Node *Fn_, FunctionRefQual Quals_)
-      : Node(KFunctionRefQualType, Fn_->ParameterPackSize,
-             /*RHSComponentCache=*/Cache::Yes, /*ArrayCache=*/Cache::No,
-             /*FunctionCache=*/Cache::Yes),
-        Fn(Fn_), Quals(Quals_) {}
-
-  bool hasFunctionSlow(OutputStream &) const override { return true; }
-  bool hasRHSComponentSlow(OutputStream &) const override { return true; }
-
-  void printQuals(OutputStream &S) const {
-    if (Quals == FrefQualLValue)
+    if (RefQual == FrefQualLValue)
       S += " &";
-    else
+    else if (RefQual == FrefQualRValue)
       S += " &&";
-  }
-
-  void printLeft(OutputStream &S) const override { Fn->printLeft(S); }
-
-  void printRight(OutputStream &S) const override {
-    Fn->printRight(S);
-    printQuals(S);
-  }
-};
-
-class FunctionQualType final : public QualType {
-public:
-  FunctionQualType(Node *Child_, Qualifiers Quals_)
-      : QualType(Child_, Quals_) {
-    K = KFunctionQualType;
-  }
-
-  void printLeft(OutputStream &S) const override { Child->printLeft(S); }
-
-  void printRight(OutputStream &S) const override {
-    if (Child->getKind() == KFunctionRefQualType) {
-      auto *RefQuals = static_cast<const FunctionRefQualType *>(Child);
-      RefQuals->Fn->printRight(S);
-      printQuals(S);
-      RefQuals->printQuals(S);
-    } else {
-      Child->printRight(S);
-      printQuals(S);
-    }
   }
 };
 
@@ -1308,7 +1340,7 @@ public:
 // -- Expression Nodes --
 
 struct Expr : public Node {
-  Expr() : Node(KExpr) {}
+  Expr(Kind K = KExpr) : Node(K) {}
 };
 
 class BinaryExpr : public Expr {
@@ -1609,6 +1641,70 @@ public:
   }
 };
 
+class InitListExpr : public Expr {
+  Node *Ty;
+  NodeArray Inits;
+public:
+  InitListExpr(Node *Ty_, NodeArray Inits_)
+      : Ty(Ty_), Inits(Inits_) {
+    if (Ty)
+      ParameterPackSize = Ty->ParameterPackSize;
+    for (Node *I : Inits)
+      ParameterPackSize = std::min(I->ParameterPackSize, ParameterPackSize);
+  }
+
+  void printLeft(OutputStream &S) const override {
+    if (Ty)
+      Ty->print(S);
+    S += '{';
+    Inits.printWithComma(S);
+    S += '}';
+  }
+};
+
+class BracedExpr : public Expr {
+  Node *Elem;
+  Node *Init;
+  bool IsArray;
+public:
+  BracedExpr(Node *Elem_, Node *Init_, bool IsArray_)
+      : Expr(KBracedExpr), Elem(Elem_), Init(Init_), IsArray(IsArray_) {}
+
+  void printLeft(OutputStream &S) const override {
+    if (IsArray) {
+      S += '[';
+      Elem->print(S);
+      S += ']';
+    } else {
+      S += '.';
+      Elem->print(S);
+    }
+    if (Init->getKind() != KBracedExpr && Init->getKind() != KBracedRangeExpr)
+      S += " = ";
+    Init->print(S);
+  }
+};
+
+class BracedRangeExpr : public Expr {
+  Node *First;
+  Node *Last;
+  Node *Init;
+public:
+  BracedRangeExpr(Node *First_, Node *Last_, Node *Init_)
+      : Expr(KBracedRangeExpr), First(First_), Last(Last_), Init(Init_) {}
+
+  void printLeft(OutputStream &S) const override {
+    S += '[';
+    First->print(S);
+    S += " ... ";
+    Last->print(S);
+    S += ']';
+    if (Init->getKind() != KBracedExpr && Init->getKind() != KBracedRangeExpr)
+      S += " = ";
+    Init->print(S);
+  }
+};
+
 class ThrowExpr : public Expr {
   const Node *Op;
 
@@ -1903,11 +1999,27 @@ struct Db {
   FunctionRefQual RefQuals = FrefQualNone;
   unsigned EncodingDepth = 0;
   bool ParsedCtorDtorCV = false;
+  bool EndsWithTemplateArgs = false;
   bool TagTemplates = true;
   bool FixForwardReferences = false;
   bool TryToParseTemplateArgs = true;
 
   BumpPointerAllocator ASTAllocator;
+
+  // A couple of members of Db are local to a specific name. When recursively
+  // parsing names we need to swap and restore them all.
+  struct SwapAndRestoreNameState {
+    SwapAndRestore<Qualifiers> SaveQualifiers;
+    SwapAndRestore<FunctionRefQual> SaveRefQualifiers;
+    SwapAndRestore<bool> SaveEndsWithTemplateArgs;
+    SwapAndRestore<bool> SaveParsedCtorDtorCV;
+
+    SwapAndRestoreNameState(Db &Parser)
+        : SaveQualifiers(Parser.CV, QualNone),
+          SaveRefQualifiers(Parser.RefQuals, FrefQualNone),
+          SaveEndsWithTemplateArgs(Parser.EndsWithTemplateArgs, false),
+          SaveParsedCtorDtorCV(Parser.ParsedCtorDtorCV, false) {}
+  };
 
   template <class T, class... Args> T *make(Args &&... args) {
     return new (ASTAllocator.allocate(sizeof(T)))
@@ -1958,6 +2070,8 @@ struct Db {
 
   StringView parseNumber(bool AllowNegative = false);
   Qualifiers parseCVQualifiers();
+  bool parsePositiveInteger(size_t *Out);
+  StringView parseBareSourceName();
 
   /// Parse the <expr> production.
   Node *parseExpr();
@@ -1969,6 +2083,21 @@ struct Db {
   Node *parseFunctionParam();
   Node *parseNewExpr();
   Node *parseConversionExpr();
+  Node *parseBracedExpr();
+
+  /// Parse the <type> production.
+  Node *parseType();
+  Node *parseFunctionType();
+  Node *parseVectorType();
+  Node *parseDecltype();
+  Node *parseArrayType();
+  Node *parsePointerToMemberType();
+  Node *parseClassEnumType();
+  Node *parseQualifiedType();
+
+  Node *parseNestedName();
+  Node *parseCtorDtorName(Node *&SoFar);
+  Node *parseAbiTags(Node *N);
 
   // FIXME: remove this when all the parse_* functions have been rewritten.
   template <const char *(*parse_fn)(const char *, const char *, Db &)>
@@ -1983,7 +2112,32 @@ struct Db {
     Names.pop_back();
     return R;
   }
+  template <const char *(*parse_fn)(const char *, const char *, Db &, bool *)>
+  Node *legacyParse() {
+    size_t BeforeType = Names.size();
+    const char *OrigFirst = First;
+    const char *T = parse_fn(First, Last, *this, nullptr);
+    if (T == OrigFirst || BeforeType + 1 != Names.size())
+      return nullptr;
+    First = T;
+    Node *R = Names.back();
+    Names.pop_back();
+    return R;
+  }
 };
+
+const char *parse_nested_name(const char *first, const char *last, Db &db,
+                              bool *endsWithTemplateArgs) {
+  db.First = first;
+  db.Last = last;
+  Node *R = db.parseNestedName();
+  if (endsWithTemplateArgs)
+    *endsWithTemplateArgs = db.EndsWithTemplateArgs;
+  if (R == nullptr)
+    return first;
+  db.Names.push_back(R);
+  return db.First;
+}
 
 const char *parse_expression(const char *first, const char *last, Db &db) {
   db.First = first;
@@ -2005,6 +2159,26 @@ const char *parse_expr_primary(const char *first, const char *last, Db &db) {
   return db.First;
 }
 
+const char *parse_type(const char *first, const char *last, Db &db) {
+  db.First = first;
+  db.Last = last;
+  Node *R = db.parseType();
+  if (R == nullptr)
+    return first;
+  db.Names.push_back(R);
+  return db.First;
+}
+
+const char *parse_decltype(const char *first, const char *last, Db &db) {
+  db.First = first;
+  db.Last = last;
+  Node *R = db.parseDecltype();
+  if (R == nullptr)
+    return first;
+  db.Names.push_back(R);
+  return db.First;
+}
+
 const char *parse_type(const char *first, const char *last, Db &db);
 const char *parse_encoding(const char *first, const char *last, Db &db);
 const char *parse_name(const char *first, const char *last, Db &db,
@@ -2012,9 +2186,186 @@ const char *parse_name(const char *first, const char *last, Db &db,
 const char *parse_template_args(const char *first, const char *last, Db &db);
 const char *parse_template_param(const char *, const char *, Db &);
 const char *parse_operator_name(const char *first, const char *last, Db &db);
+const char *parse_source_name(const char *, const char *, Db &);
 const char *parse_unqualified_name(const char *first, const char *last, Db &db);
 const char *parse_decltype(const char *first, const char *last, Db &db);
 const char *parse_unresolved_name(const char *, const char *, Db &);
+const char *parse_substitution(const char *, const char *, Db &);
+
+
+// <ctor-dtor-name> ::= C1  # complete object constructor
+//                  ::= C2  # base object constructor
+//                  ::= C3  # complete object allocating constructor
+//   extension      ::= C5    # ?
+//                  ::= D0  # deleting destructor
+//                  ::= D1  # complete object destructor
+//                  ::= D2  # base object destructor
+//   extension      ::= D5    # ?
+Node *Db::parseCtorDtorName(Node *&SoFar) {
+  if (SoFar->K == Node::KSpecialSubstitution) {
+    auto SSK = static_cast<SpecialSubstitution *>(SoFar)->SSK;
+    switch (SSK) {
+    case SpecialSubKind::string:
+    case SpecialSubKind::istream:
+    case SpecialSubKind::ostream:
+    case SpecialSubKind::iostream:
+      SoFar = make<ExpandedSpecialSubstitution>(SSK);
+    default:
+      break;
+    }
+  }
+
+  if (consumeIf('C')) {
+    bool IsInherited = consumeIf('I');
+    if (look() != '1' && look() != '2' && look() != '3' && look() != '5')
+      return nullptr;
+    ++First;
+    ParsedCtorDtorCV = true;
+    if (IsInherited) {
+      if (legacyParse<parse_name>() == nullptr)
+        return nullptr;
+    }
+    return make<CtorDtorName>(SoFar, false);
+  }
+
+  if (look() == 'D' &&
+      (look(1) == '0' || look(1) == '1' || look(1) == '2' || look(1) == '5')) {
+    First += 2;
+    ParsedCtorDtorCV = true;
+    return make<CtorDtorName>(SoFar, true);
+  }
+
+  return nullptr;
+}
+
+// <nested-name> ::= N [<CV-Qualifiers>] [<ref-qualifier>] <prefix> <unqualified-name> E
+//               ::= N [<CV-Qualifiers>] [<ref-qualifier>] <template-prefix> <template-args> E
+//
+// <prefix> ::= <prefix> <unqualified-name>
+//          ::= <template-prefix> <template-args>
+//          ::= <template-param>
+//          ::= <decltype>
+//          ::= # empty
+//          ::= <substitution>
+//          ::= <prefix> <data-member-prefix>
+//  extension ::= L
+//
+// <template-prefix> ::= <prefix> <template unqualified-name>
+//                   ::= <template-param>
+//                   ::= <substitution>
+Node *Db::parseNestedName() {
+  if (!consumeIf('N'))
+    return nullptr;
+
+  CV = parseCVQualifiers();
+  if      (consumeIf('O')) RefQuals = FrefQualRValue;
+  else if (consumeIf('R')) RefQuals = FrefQualLValue;
+  else                     RefQuals = FrefQualNone;
+
+  Node *SoFar = nullptr;
+  auto PushComponent = [&](Node *Comp) {
+    if (SoFar) SoFar = make<QualifiedName>(SoFar, Comp);
+    else       SoFar = Comp;
+    EndsWithTemplateArgs = false;
+  };
+
+  if (consumeIf("St"))
+    SoFar = make<NameType>("std");
+
+  while (!consumeIf('E')) {
+    consumeIf('L'); // extension
+
+    //          ::= <template-param>
+    if (look() == 'T') {
+      Node *TP = legacyParse<parse_template_param>();
+      if (TP == nullptr)
+        return nullptr;
+      PushComponent(TP);
+      Subs.push_back(SoFar);
+      continue;
+    }
+
+    //          ::= <template-prefix> <template-args>
+    if (look() == 'I') {
+      Node *TA;
+      {
+        SwapAndRestoreNameState SaveState(*this);
+        TA = legacyParse<parse_template_args>();
+      }
+      if (TA == nullptr || SoFar == nullptr)
+        return nullptr;
+      SoFar = make<NameWithTemplateArgs>(SoFar, TA);
+      EndsWithTemplateArgs = true;
+      Subs.push_back(SoFar);
+      continue;
+    }
+
+    //          ::= <decltype>
+    if (look() == 'D' && (look(1) == 't' || look(1) == 'T')) {
+      Node *DT;
+      {
+        SwapAndRestoreNameState SaveState(*this);
+        DT = parseDecltype();
+      }
+      if (DT == nullptr)
+        return nullptr;
+      PushComponent(DT);
+      Subs.push_back(SoFar);
+      continue;
+    }
+
+    //          ::= <substitution>
+    if (look() == 'S' && look(1) != 't') {
+      Node *S = legacyParse<parse_substitution>();
+      if (S == nullptr)
+        return nullptr;
+      PushComponent(S);
+      if (SoFar != S)
+        Subs.push_back(S);
+      continue;
+    }
+
+    // Parse an <unqualified-name> thats actually a <ctor-dtor-name>.
+    if (look() == 'C' || look() == 'D') {
+      if (SoFar == nullptr)
+        return nullptr;
+      Node *CtorDtor = parseCtorDtorName(SoFar);
+      if (CtorDtor == nullptr)
+        return nullptr;
+      PushComponent(CtorDtor);
+      SoFar = parseAbiTags(SoFar);
+      if (SoFar == nullptr)
+        return nullptr;
+      Subs.push_back(SoFar);
+      continue;
+    }
+
+    //          ::= <prefix> <unqualified-name>
+    Node *N = legacyParse<parse_unqualified_name>();
+    if (N == nullptr)
+      return nullptr;
+    PushComponent(N);
+    Subs.push_back(SoFar);
+  }
+
+  if (SoFar == nullptr || Subs.empty())
+    return nullptr;
+
+  Subs.pop_back();
+  return SoFar;
+}
+
+// <abi-tags> ::= <abi-tag> [<abi-tags>]
+// <abi-tag> ::= B <source-name>
+Node *Db::parseAbiTags(Node *N) {
+  while (consumeIf('B')) {
+    StringView SN = parseBareSourceName();
+    if (SN.empty())
+      return nullptr;
+    N = make<AbiTagAttr>(N, SN);
+  }
+  return N;
+}
 
 // <number> ::= [n] <non-negative decimal integer>
 StringView Db::parseNumber(bool AllowNegative) {
@@ -2026,6 +2377,602 @@ StringView Db::parseNumber(bool AllowNegative) {
   while (numLeft() != 0 && std::isdigit(*First))
     ++First;
   return StringView(Tmp, First);
+}
+
+// <positive length number> ::= [0-9]*
+bool Db::parsePositiveInteger(size_t *Out) {
+  *Out = 0;
+  if (look() < '0' || look() > '9')
+    return true;
+  while (look() >= '0' && look() <= '9') {
+    *Out *= 10;
+    *Out += static_cast<size_t>(consume() - '0');
+  }
+  return false;
+}
+
+StringView Db::parseBareSourceName() {
+  size_t Int = 0;
+  if (parsePositiveInteger(&Int) || numLeft() < Int)
+    return StringView();
+  StringView R(First, First + Int);
+  First += Int;
+  return R;
+}
+
+// <function-type> ::= [<CV-qualifiers>] [<exception-spec>] [Dx] F [Y] <bare-function-type> [<ref-qualifier>] E
+//
+// <exception-spec> ::= Do                # non-throwing exception-specification (e.g., noexcept, throw())
+//                  ::= DO <expression> E # computed (instantiation-dependent) noexcept
+//                  ::= Dw <type>+ E      # dynamic exception specification with instantiation-dependent types
+//
+// <ref-qualifier> ::= R                   # & ref-qualifier
+// <ref-qualifier> ::= O                   # && ref-qualifier
+Node *Db::parseFunctionType() {
+  Qualifiers CVQuals = parseCVQualifiers();
+
+  Node *ExceptionSpec = nullptr;
+  if (consumeIf("Do")) {
+    ExceptionSpec = make<NameType>("noexcept");
+  } else if (consumeIf("DO")) {
+    Node *E = parseExpr();
+    if (E == nullptr || !consumeIf('E'))
+      return nullptr;
+    ExceptionSpec = make<NoexceptSpec>(E);
+  } else if (consumeIf("Dw")) {
+    size_t SpecsBegin = Names.size();
+    while (!consumeIf('E')) {
+      Node *T = parseType();
+      if (T == nullptr)
+        return nullptr;
+      Names.push_back(T);
+    }
+    ExceptionSpec =
+      make<DynamicExceptionSpec>(popTrailingNodeArray(SpecsBegin));
+  }
+
+  consumeIf("Dx"); // transaction safe
+
+  if (!consumeIf('F'))
+    return nullptr;
+  consumeIf('Y'); // extern "C"
+  Node *ReturnType = parseType();
+  if (ReturnType == nullptr)
+    return nullptr;
+
+  FunctionRefQual ReferenceQualifier = FrefQualNone;
+  size_t ParamsBegin = Names.size();
+  while (true) {
+    if (consumeIf('E'))
+      break;
+    if (consumeIf('v'))
+      continue;
+    if (consumeIf("RE")) {
+      ReferenceQualifier = FrefQualLValue;
+      break;
+    }
+    if (consumeIf("OE")) {
+      ReferenceQualifier = FrefQualRValue;
+      break;
+    }
+    Node *T = parseType();
+    if (T == nullptr)
+      return nullptr;
+    Names.push_back(T);
+  }
+
+  NodeArray Params = popTrailingNodeArray(ParamsBegin);
+  return make<FunctionType>(ReturnType, Params, CVQuals,
+                            ReferenceQualifier, ExceptionSpec);
+}
+
+// extension:
+// <vector-type>           ::= Dv <positive dimension number> _ <extended element type>
+//                         ::= Dv [<dimension expression>] _ <element type>
+// <extended element type> ::= <element type>
+//                         ::= p # AltiVec vector pixel
+Node *Db::parseVectorType() {
+  if (!consumeIf("Dv"))
+    return nullptr;
+  if (look() >= '1' && look() <= '9') {
+    StringView DimensionNumber = parseNumber();
+    if (!consumeIf('_'))
+      return nullptr;
+    if (consumeIf('p'))
+      return make<VectorType>(DimensionNumber);
+    Node *ElemType = parseType();
+    if (ElemType == nullptr)
+      return nullptr;
+    return make<VectorType>(ElemType, DimensionNumber);
+  }
+
+  if (!consumeIf('_')) {
+    Node *DimExpr = parseExpr();
+    if (!DimExpr)
+      return nullptr;
+    if (!consumeIf('_'))
+      return nullptr;
+    Node *ElemType = parseType();
+    if (!ElemType)
+      return nullptr;
+    return make<VectorType>(ElemType, DimExpr);
+  }
+  Node *ElemType = parseType();
+  if (!ElemType)
+    return nullptr;
+  return make<VectorType>(ElemType, StringView());
+}
+
+// <decltype>  ::= Dt <expression> E  # decltype of an id-expression or class member access (C++0x)
+//             ::= DT <expression> E  # decltype of an expression (C++0x)
+Node *Db::parseDecltype() {
+  if (!consumeIf('D'))
+    return nullptr;
+  if (!consumeIf('t') && !consumeIf('T'))
+    return nullptr;
+  Node *E = parseExpr();
+  if (E == nullptr)
+    return nullptr;
+  if (!consumeIf('E'))
+    return nullptr;
+  return make<EnclosingExpr>("decltype(", E, ")");
+}
+
+// <array-type> ::= A <positive dimension number> _ <element type>
+//              ::= A [<dimension expression>] _ <element type>
+Node *Db::parseArrayType() {
+  if (!consumeIf('A'))
+    return nullptr;
+
+  if (std::isdigit(look())) {
+    StringView Dimension = parseNumber();
+    if (!consumeIf('_'))
+      return nullptr;
+    Node *Ty = parseType();
+    if (Ty == nullptr)
+      return nullptr;
+    return make<ArrayType>(Ty, Dimension);
+  }
+
+  if (!consumeIf('_')) {
+    Node *DimExpr = parseExpr();
+    if (DimExpr == nullptr)
+      return nullptr;
+    if (!consumeIf('_'))
+      return nullptr;
+    Node *ElementType = parseType();
+    if (ElementType == nullptr)
+      return nullptr;
+    return make<ArrayType>(ElementType, DimExpr);
+  }
+
+  Node *Ty = parseType();
+  if (Ty == nullptr)
+    return nullptr;
+  return make<ArrayType>(Ty);
+}
+
+// <pointer-to-member-type> ::= M <class type> <member type>
+Node *Db::parsePointerToMemberType() {
+  if (!consumeIf('M'))
+    return nullptr;
+  Node *ClassType = parseType();
+  if (ClassType == nullptr)
+    return nullptr;
+  Node *MemberType = parseType();
+  if (MemberType == nullptr)
+    return nullptr;
+  return make<PointerToMemberType>(ClassType, MemberType);
+}
+
+// <class-enum-type> ::= <name>     # non-dependent type name, dependent type name, or dependent typename-specifier
+//                   ::= Ts <name>  # dependent elaborated type specifier using 'struct' or 'class'
+//                   ::= Tu <name>  # dependent elaborated type specifier using 'union'
+//                   ::= Te <name>  # dependent elaborated type specifier using 'enum'
+Node *Db::parseClassEnumType() {
+  StringView ElabSpef;
+  if (consumeIf("Ts"))
+    ElabSpef = "struct";
+  else if (consumeIf("Tu"))
+    ElabSpef = "union";
+  else if (consumeIf("Te"))
+    ElabSpef = "enum";
+
+  Node *Name = legacyParse<parse_name>();
+  if (Name == nullptr)
+    return nullptr;
+
+  if (!ElabSpef.empty())
+    return make<ElaboratedTypeSpefType>(ElabSpef, Name);
+
+  return Name;
+}
+
+// <qualified-type>     ::= <qualifiers> <type>
+// <qualifiers> ::= <extended-qualifier>* <CV-qualifiers>
+// <extended-qualifier> ::= U <source-name> [<template-args>] # vendor extended type qualifier
+Node *Db::parseQualifiedType() {
+  if (consumeIf('U')) {
+    StringView Qual = parseBareSourceName();
+    if (Qual.empty())
+      return nullptr;
+
+    // FIXME parse the optional <template-args> here!
+
+    // extension            ::= U <objc-name> <objc-type>  # objc-type<identifier>
+    if (Qual.startsWith("objcproto")) {
+      StringView ProtoSourceName = Qual.dropFront(std::strlen("objcproto"));
+      StringView Proto;
+      {
+        SwapAndRestore<const char *> SaveFirst(First, ProtoSourceName.begin()),
+                                     SaveLast(Last, ProtoSourceName.end());
+        Proto = parseBareSourceName();
+      }
+      if (Proto.empty())
+        return nullptr;
+      Node *Child = parseQualifiedType();
+      if (Child == nullptr)
+        return nullptr;
+      return make<ObjCProtoName>(Child, Proto);
+    }
+
+    Node *Child = parseQualifiedType();
+    if (Child == nullptr)
+      return nullptr;
+    return make<VendorExtQualType>(Child, Qual);
+  }
+
+  Qualifiers Quals = parseCVQualifiers();
+  Node *Ty = parseType();
+  if (Ty == nullptr)
+    return nullptr;
+  if (Quals != QualNone)
+    Ty = make<QualType>(Ty, Quals);
+  return Ty;
+}
+
+// <type>      ::= <builtin-type>
+//             ::= <qualified-type>
+//             ::= <function-type>
+//             ::= <class-enum-type>
+//             ::= <array-type>
+//             ::= <pointer-to-member-type>
+//             ::= <template-param>
+//             ::= <template-template-param> <template-args>
+//             ::= <decltype>
+//             ::= P <type>        # pointer
+//             ::= R <type>        # l-value reference
+//             ::= O <type>        # r-value reference (C++11)
+//             ::= C <type>        # complex pair (C99)
+//             ::= G <type>        # imaginary (C99)
+//             ::= <substitution>  # See Compression below
+// extension   ::= U <objc-name> <objc-type>  # objc-type<identifier>
+// extension   ::= <vector-type> # <vector-type> starts with Dv
+//
+// <objc-name> ::= <k0 number> objcproto <k1 number> <identifier>  # k0 = 9 + <number of digits in k1> + k1
+// <objc-type> ::= <source-name>  # PU<11+>objcproto 11objc_object<source-name> 11objc_object -> id<source-name>
+Node *Db::parseType() {
+  Node *Result = nullptr;
+
+  switch (look()) {
+  //             ::= <qualified-type>
+  case 'r':
+  case 'V':
+  case 'K': {
+    unsigned AfterQuals = 0;
+    if (look(AfterQuals) == 'r') ++AfterQuals;
+    if (look(AfterQuals) == 'V') ++AfterQuals;
+    if (look(AfterQuals) == 'K') ++AfterQuals;
+
+    if (look(AfterQuals) == 'F' ||
+        (look(AfterQuals) == 'D' &&
+         (look(AfterQuals + 1) == 'o' || look(AfterQuals + 1) == 'O' ||
+          look(AfterQuals + 1) == 'w' || look(AfterQuals + 1) == 'x'))) {
+      Result = parseFunctionType();
+      break;
+    }
+    _LIBCPP_FALLTHROUGH();
+  }
+  case 'U': {
+    Result = parseQualifiedType();
+    break;
+  }
+  // <builtin-type> ::= v    # void
+  case 'v':
+    ++First;
+    return make<NameType>("void");
+  //                ::= w    # wchar_t
+  case 'w':
+    ++First;
+    return make<NameType>("wchar_t");
+  //                ::= b    # bool
+  case 'b':
+    ++First;
+    return make<NameType>("bool");
+  //                ::= c    # char
+  case 'c':
+    ++First;
+    return make<NameType>("char");
+  //                ::= a    # signed char
+  case 'a':
+    ++First;
+    return make<NameType>("signed char");
+  //                ::= h    # unsigned char
+  case 'h':
+    ++First;
+    return make<NameType>("unsigned char");
+  //                ::= s    # short
+  case 's':
+    ++First;
+    return make<NameType>("short");
+  //                ::= t    # unsigned short
+  case 't':
+    ++First;
+    return make<NameType>("unsigned short");
+  //                ::= i    # int
+  case 'i':
+    ++First;
+    return make<NameType>("int");
+  //                ::= j    # unsigned int
+  case 'j':
+    ++First;
+    return make<NameType>("unsigned int");
+  //                ::= l    # long
+  case 'l':
+    ++First;
+    return make<NameType>("long");
+  //                ::= m    # unsigned long
+  case 'm':
+    ++First;
+    return make<NameType>("unsigned long");
+  //                ::= x    # long long, __int64
+  case 'x':
+    ++First;
+    return make<NameType>("long long");
+  //                ::= y    # unsigned long long, __int64
+  case 'y':
+    ++First;
+    return make<NameType>("unsigned long long");
+  //                ::= n    # __int128
+  case 'n':
+    ++First;
+    return make<NameType>("__int128");
+  //                ::= o    # unsigned __int128
+  case 'o':
+    ++First;
+    return make<NameType>("unsigned __int128");
+  //                ::= f    # float
+  case 'f':
+    ++First;
+    return make<NameType>("float");
+  //                ::= d    # double
+  case 'd':
+    ++First;
+    return make<NameType>("double");
+  //                ::= e    # long double, __float80
+  case 'e':
+    ++First;
+    return make<NameType>("long double");
+  //                ::= g    # __float128
+  case 'g':
+    ++First;
+    return make<NameType>("__float128");
+  //                ::= z    # ellipsis
+  case 'z':
+    ++First;
+    return make<NameType>("...");
+
+  // <builtin-type> ::= u <source-name>    # vendor extended type
+  case 'u': {
+    ++First;
+    StringView Res = parseBareSourceName();
+    if (Res.empty())
+      return nullptr;
+    return make<NameType>(Res);
+  }
+  case 'D':
+    switch (look(1)) {
+    //                ::= Dd   # IEEE 754r decimal floating point (64 bits)
+    case 'd':
+      First += 2;
+      return make<NameType>("decimal64");
+    //                ::= De   # IEEE 754r decimal floating point (128 bits)
+    case 'e':
+      First += 2;
+      return make<NameType>("decimal128");
+    //                ::= Df   # IEEE 754r decimal floating point (32 bits)
+    case 'f':
+      First += 2;
+      return make<NameType>("decimal32");
+    //                ::= Dh   # IEEE 754r half-precision floating point (16 bits)
+    case 'h':
+      First += 2;
+      return make<NameType>("decimal16");
+    //                ::= Di   # char32_t
+    case 'i':
+      First += 2;
+      return make<NameType>("char32_t");
+    //                ::= Ds   # char16_t
+    case 's':
+      First += 2;
+      return make<NameType>("char16_t");
+    //                ::= Da   # auto (in dependent new-expressions)
+    case 'a':
+      First += 2;
+      return make<NameType>("auto");
+    //                ::= Dc   # decltype(auto)
+    case 'c':
+      First += 2;
+      return make<NameType>("decltype(auto)");
+    //                ::= Dn   # std::nullptr_t (i.e., decltype(nullptr))
+    case 'n':
+      First += 2;
+      return make<NameType>("std::nullptr_t");
+
+    //             ::= <decltype>
+    case 't':
+    case 'T': {
+      Result = parseDecltype();
+      break;
+    }
+    // extension   ::= <vector-type> # <vector-type> starts with Dv
+    case 'v': {
+      Result = parseVectorType();
+      break;
+    }
+    //           ::= Dp <type>       # pack expansion (C++0x)
+    case 'p': {
+      First += 2;
+      Node *Child = parseType();
+      if (!Child)
+        return nullptr;
+      Result = make<ParameterPackExpansion>(Child);
+      break;
+    }
+    // Exception specifier on a function type.
+    case 'o':
+    case 'O':
+    case 'w':
+    // Transaction safe function type.
+    case 'x':
+      Result = parseFunctionType();
+      break;
+    }
+    break;
+  //             ::= <function-type>
+  case 'F': {
+    Result = parseFunctionType();
+    break;
+  }
+  //             ::= <array-type>
+  case 'A': {
+    Result = parseArrayType();
+    break;
+  }
+  //             ::= <pointer-to-member-type>
+  case 'M': {
+    Result = parsePointerToMemberType();
+    break;
+  }
+  //             ::= <template-param>
+  case 'T': {
+    // This could be an elaborate type specifier on a <class-enum-type>.
+    if (look(1) == 's' || look(1) == 'u' || look(1) == 'e') {
+      Result = parseClassEnumType();
+      break;
+    }
+
+    Result = legacyParse<parse_template_param>();
+    if (Result == nullptr)
+      return nullptr;
+
+    // Result could be either of:
+    //   <type>        ::= <template-param>
+    //   <type>        ::= <template-template-param> <template-args>
+    //
+    //   <template-template-param> ::= <template-param>
+    //                             ::= <substitution>
+    //
+    // If this is followed by some <template-args>, and we're permitted to
+    // parse them, take the second production.
+
+    if (TryToParseTemplateArgs && look() == 'I') {
+      Node *TA = legacyParse<parse_template_args>();
+      if (TA == nullptr)
+        return nullptr;
+      Result = make<NameWithTemplateArgs>(Result, TA);
+    }
+    break;
+  }
+  //             ::= P <type>        # pointer
+  case 'P': {
+    ++First;
+    Node *Ptr = parseType();
+    if (Ptr == nullptr)
+      return nullptr;
+    Result = make<PointerType>(Ptr);
+    break;
+  }
+  //             ::= R <type>        # l-value reference
+  case 'R': {
+    ++First;
+    Node *Ref = parseType();
+    if (Ref == nullptr)
+      return nullptr;
+    Result = make<LValueReferenceType>(Ref);
+    break;
+  }
+  //             ::= O <type>        # r-value reference (C++11)
+  case 'O': {
+    ++First;
+    Node *Ref = parseType();
+    if (Ref == nullptr)
+      return nullptr;
+    Result = make<RValueReferenceType>(Ref);
+    break;
+  }
+  //             ::= C <type>        # complex pair (C99)
+  case 'C': {
+    ++First;
+    Node *P = parseType();
+    if (P == nullptr)
+      return nullptr;
+    Result = make<PostfixQualifiedType>(P, " complex");
+    break;
+  }
+  //             ::= G <type>        # imaginary (C99)
+  case 'G': {
+    ++First;
+    Node *P = parseType();
+    if (P == nullptr)
+      return P;
+    Result = make<PostfixQualifiedType>(P, " imaginary");
+    break;
+  }
+  //             ::= <substitution>  # See Compression below
+  case 'S': {
+    if (look(1) && look(1) != 't') {
+      Node *Sub = legacyParse<parse_substitution>();
+      if (Sub == nullptr)
+        return nullptr;
+
+      // Sub could be either of:
+      //   <type>        ::= <substitution>
+      //   <type>        ::= <template-template-param> <template-args>
+      //
+      //   <template-template-param> ::= <template-param>
+      //                             ::= <substitution>
+      //
+      // If this is followed by some <template-args>, and we're permitted to
+      // parse them, take the second production.
+
+      if (TryToParseTemplateArgs && look() == 'I') {
+        Node *TA = legacyParse<parse_template_args>();
+        if (TA == nullptr)
+          return nullptr;
+        Result = make<NameWithTemplateArgs>(Sub, TA);
+        break;
+      }
+
+      // If all we parsed was a substitution, don't re-insert into the
+      // substitution table.
+      return Sub;
+    }
+    _LIBCPP_FALLTHROUGH();
+  }
+  //        ::= <class-enum-type>
+  default: {
+    Result = parseClassEnumType();
+    break;
+  }
+  }
+
+  // If we parsed a type, insert it into the substitution table. Note that all
+  // <builtin-type>s and <substitution>s have already bailed out, because they
+  // don't get substitutions.
+  if (Result != nullptr)
+    Subs.push_back(Result);
+  return Result;
 }
 
 Node *Db::parsePrefixExpr(StringView Kind) {
@@ -2052,6 +2999,7 @@ Node *Db::parseIntegerLiteral(StringView Lit) {
   return nullptr;
 }
 
+// <CV-Qualifiers> ::= [r] [V] [K]
 Qualifiers Db::parseCVQualifiers() {
   Qualifiers CVR = QualNone;
   if (consumeIf('r'))
@@ -2107,7 +3055,7 @@ Node *Db::parseNewExpr() {
     Names.push_back(Ex);
   }
   NodeArray ExprList = popTrailingNodeArray(Exprs);
-  Node *Ty = legacyParse<parse_type>();
+  Node *Ty = parseType();
   if (Ty == nullptr)
     return Ty;
   if (consumeIf("pi")) {
@@ -2133,7 +3081,7 @@ Node *Db::parseConversionExpr() {
   Node *Ty;
   {
     SwapAndRestore<bool> SaveTemp(TryToParseTemplateArgs, false);
-    Ty = legacyParse<parse_type>();
+    Ty = parseType();
   }
 
   if (Ty == nullptr)
@@ -2237,7 +3185,7 @@ Node *Db::parseExprPrimary() {
     return nullptr;
   default: {
     // might be named type
-    Node *T = legacyParse<parse_type>();
+    Node *T = parseType();
     if (T == nullptr)
       return nullptr;
     StringView N = parseNumber();
@@ -2251,6 +3199,51 @@ Node *Db::parseExprPrimary() {
     return nullptr;
   }
   }
+}
+
+// <braced-expression> ::= <expression>
+//                     ::= di <field source-name> <braced-expression>    # .name = expr
+//                     ::= dx <index expression> <braced-expression>     # [expr] = expr
+//                     ::= dX <range begin expression> <range end expression> <braced-expression>
+Node *Db::parseBracedExpr() {
+  if (look() == 'd') {
+    switch (look(1)) {
+    case 'i': {
+      First += 2;
+      Node *Field = legacyParse<parse_source_name>();
+      if (Field == nullptr)
+        return nullptr;
+      Node *Init = parseBracedExpr();
+      if (Init == nullptr)
+        return nullptr;
+      return make<BracedExpr>(Field, Init, /*isArray=*/false);
+    }
+    case 'x': {
+      First += 2;
+      Node *Index = parseExpr();
+      if (Index == nullptr)
+        return nullptr;
+      Node *Init = parseBracedExpr();
+      if (Init == nullptr)
+        return nullptr;
+      return make<BracedExpr>(Index, Init, /*isArray=*/true);
+    }
+    case 'X': {
+      First += 2;
+      Node *RangeBegin = parseExpr();
+      if (RangeBegin == nullptr)
+        return nullptr;
+      Node *RangeEnd = parseExpr();
+      if (RangeEnd == nullptr)
+        return nullptr;
+      Node *Init = parseBracedExpr();
+      if (Init == nullptr)
+        return nullptr;
+      return make<BracedRangeExpr>(RangeBegin, RangeEnd, Init);
+    }
+    }
+  }
+  return parseExpr();
 }
 
 // <expression> ::= <unary operator-name> <expression>
@@ -2327,7 +3320,7 @@ Node *Db::parseExpr() {
       return parseBinaryExpr("=");
     case 't': {
       First += 2;
-      Node *Ty = legacyParse<parse_type>();
+      Node *Ty = parseType();
       if (Ty == nullptr)
         return nullptr;
       return make<EnclosingExpr>("alignof (", Ty, ")");
@@ -2346,7 +3339,7 @@ Node *Db::parseExpr() {
     // cc <type> <expression>                               # const_cast<type>(expression)
     case 'c': {
       First += 2;
-      Node *Ty = legacyParse<parse_type>();
+      Node *Ty = parseType();
       if (Ty == nullptr)
         return Ty;
       Node *Ex = parseExpr();
@@ -2390,7 +3383,7 @@ Node *Db::parseExpr() {
     }
     case 'c': {
       First += 2;
-      Node *T = legacyParse<parse_type>();
+      Node *T = parseType();
       if (T == nullptr)
         return T;
       Node *Ex = parseExpr();
@@ -2462,7 +3455,8 @@ Node *Db::parseExpr() {
     }
     return nullptr;
   case 'i':
-    if (First[1] == 'x') {
+    switch (First[1]) {
+    case 'x': {
       First += 2;
       Node *Base = parseExpr();
       if (Base == nullptr)
@@ -2471,6 +3465,18 @@ Node *Db::parseExpr() {
       if (Index == nullptr)
         return Index;
       return make<ArraySubscriptExpr>(Base, Index);
+    }
+    case 'l': {
+      First += 2;
+      size_t InitsBegin = Names.size();
+      while (!consumeIf('E')) {
+        Node *E = parseBracedExpr();
+        if (E == nullptr)
+          return nullptr;
+        Names.push_back(E);
+      }
+      return make<InitListExpr>(nullptr, popTrailingNodeArray(InitsBegin));
+    }
     }
     return nullptr;
   case 'l':
@@ -2589,17 +3595,22 @@ Node *Db::parseExpr() {
     if (First[1] == 'u') {
       First += 2;
       Node *Cond = parseExpr();
+      if (Cond == nullptr)
+        return nullptr;
       Node *LHS = parseExpr();
+      if (LHS == nullptr)
+        return nullptr;
       Node *RHS = parseExpr();
-      if (Cond && LHS && RHS)
-        return make<ConditionalExpr>(Cond, LHS, RHS);
+      if (RHS == nullptr)
+        return nullptr;
+      return make<ConditionalExpr>(Cond, LHS, RHS);
     }
     return nullptr;
   case 'r':
     switch (First[1]) {
     case 'c': {
       First += 2;
-      Node *T = legacyParse<parse_type>();
+      Node *T = parseType();
       if (T == nullptr)
         return T;
       Node *Ex = parseExpr();
@@ -2625,7 +3636,7 @@ Node *Db::parseExpr() {
     switch (First[1]) {
     case 'c': {
       First += 2;
-      Node *T = legacyParse<parse_type>();
+      Node *T = parseType();
       if (T == nullptr)
         return T;
       Node *Ex = parseExpr();
@@ -2644,7 +3655,7 @@ Node *Db::parseExpr() {
       return legacyParse<parse_unresolved_name>();
     case 't': {
       First += 2;
-      Node *Ty = legacyParse<parse_type>();
+      Node *Ty = parseType();
       if (Ty == nullptr)
         return Ty;
       return make<EnclosingExpr>("sizeof (", Ty, ")");
@@ -2683,10 +3694,24 @@ Node *Db::parseExpr() {
     }
     case 'i': {
       First += 2;
-      Node *Ty = legacyParse<parse_type>();
+      Node *Ty = parseType();
       if (Ty == nullptr)
         return Ty;
       return make<EnclosingExpr>("typeid (", Ty, ")");
+    }
+    case 'l': {
+      First += 2;
+      Node *Ty = parseType();
+      if (Ty == nullptr)
+        return nullptr;
+      size_t InitsBegin = Names.size();
+      while (!consumeIf('E')) {
+        Node *E = parseBracedExpr();
+        if (E == nullptr)
+          return nullptr;
+        Names.push_back(E);
+      }
+      return make<InitListExpr>(Ty, popTrailingNodeArray(InitsBegin));
     }
     case 'r':
       First += 2;
@@ -2948,212 +3973,6 @@ parse_substitution(const char* first, const char* last, Db& db)
                 }
                 break;
             }
-        }
-    }
-    return first;
-}
-
-// <builtin-type> ::= v    # void
-//                ::= w    # wchar_t
-//                ::= b    # bool
-//                ::= c    # char
-//                ::= a    # signed char
-//                ::= h    # unsigned char
-//                ::= s    # short
-//                ::= t    # unsigned short
-//                ::= i    # int
-//                ::= j    # unsigned int
-//                ::= l    # long
-//                ::= m    # unsigned long
-//                ::= x    # long long, __int64
-//                ::= y    # unsigned long long, __int64
-//                ::= n    # __int128
-//                ::= o    # unsigned __int128
-//                ::= f    # float
-//                ::= d    # double
-//                ::= e    # long double, __float80
-//                ::= g    # __float128
-//                ::= z    # ellipsis
-//                ::= Dd   # IEEE 754r decimal floating point (64 bits)
-//                ::= De   # IEEE 754r decimal floating point (128 bits)
-//                ::= Df   # IEEE 754r decimal floating point (32 bits)
-//                ::= Dh   # IEEE 754r half-precision floating point (16 bits)
-//                ::= Di   # char32_t
-//                ::= Ds   # char16_t
-//                ::= Da   # auto (in dependent new-expressions)
-//                ::= Dc   # decltype(auto)
-//                ::= Dn   # std::nullptr_t (i.e., decltype(nullptr))
-//                ::= u <source-name>    # vendor extended type
-
-const char*
-parse_builtin_type(const char* first, const char* last, Db& db)
-{
-    if (first != last)
-    {
-        switch (*first)
-        {
-        case 'v':
-            db.Names.push_back(db.make<NameType>("void"));
-            ++first;
-            break;
-        case 'w':
-            db.Names.push_back(db.make<NameType>("wchar_t"));
-            ++first;
-            break;
-        case 'b':
-            db.Names.push_back(db.make<NameType>("bool"));
-            ++first;
-            break;
-        case 'c':
-            db.Names.push_back(db.make<NameType>("char"));
-            ++first;
-            break;
-        case 'a':
-            db.Names.push_back(db.make<NameType>("signed char"));
-            ++first;
-            break;
-        case 'h':
-            db.Names.push_back(db.make<NameType>("unsigned char"));
-            ++first;
-            break;
-        case 's':
-            db.Names.push_back(db.make<NameType>("short"));
-            ++first;
-            break;
-        case 't':
-            db.Names.push_back(db.make<NameType>("unsigned short"));
-            ++first;
-            break;
-        case 'i':
-            db.Names.push_back(db.make<NameType>("int"));
-            ++first;
-            break;
-        case 'j':
-            db.Names.push_back(db.make<NameType>("unsigned int"));
-            ++first;
-            break;
-        case 'l':
-            db.Names.push_back(db.make<NameType>("long"));
-            ++first;
-            break;
-        case 'm':
-            db.Names.push_back(db.make<NameType>("unsigned long"));
-            ++first;
-            break;
-        case 'x':
-            db.Names.push_back(db.make<NameType>("long long"));
-            ++first;
-            break;
-        case 'y':
-            db.Names.push_back(db.make<NameType>("unsigned long long"));
-            ++first;
-            break;
-        case 'n':
-            db.Names.push_back(db.make<NameType>("__int128"));
-            ++first;
-            break;
-        case 'o':
-            db.Names.push_back(db.make<NameType>("unsigned __int128"));
-            ++first;
-            break;
-        case 'f':
-            db.Names.push_back(db.make<NameType>("float"));
-            ++first;
-            break;
-        case 'd':
-            db.Names.push_back(db.make<NameType>("double"));
-            ++first;
-            break;
-        case 'e':
-            db.Names.push_back(db.make<NameType>("long double"));
-            ++first;
-            break;
-        case 'g':
-            db.Names.push_back(db.make<NameType>("__float128"));
-            ++first;
-            break;
-        case 'z':
-            db.Names.push_back(db.make<NameType>("..."));
-            ++first;
-            break;
-        case 'u':
-            {
-                const char*t = parse_source_name(first+1, last, db);
-                if (t != first+1)
-                    first = t;
-            }
-            break;
-        case 'D':
-            if (first+1 != last)
-            {
-                switch (first[1])
-                {
-                case 'd':
-                    db.Names.push_back(db.make<NameType>("decimal64"));
-                    first += 2;
-                    break;
-                case 'e':
-                    db.Names.push_back(db.make<NameType>("decimal128"));
-                    first += 2;
-                    break;
-                case 'f':
-                    db.Names.push_back(db.make<NameType>("decimal32"));
-                    first += 2;
-                    break;
-                case 'h':
-                    db.Names.push_back(db.make<NameType>("decimal16"));
-                    first += 2;
-                    break;
-                case 'i':
-                    db.Names.push_back(db.make<NameType>("char32_t"));
-                    first += 2;
-                    break;
-                case 's':
-                    db.Names.push_back(db.make<NameType>("char16_t"));
-                    first += 2;
-                    break;
-                case 'a':
-                    db.Names.push_back(db.make<NameType>("auto"));
-                    first += 2;
-                    break;
-                case 'c':
-                    db.Names.push_back(db.make<NameType>("decltype(auto)"));
-                    first += 2;
-                    break;
-                case 'n':
-                    db.Names.push_back(db.make<NameType>("std::nullptr_t"));
-                    first += 2;
-                    break;
-                }
-            }
-            break;
-        }
-    }
-    return first;
-}
-
-// <CV-Qualifiers> ::= [r] [V] [K]
-
-const char*
-parse_cv_qualifiers(const char* first, const char* last, Qualifiers& cv)
-{
-    cv = QualNone;
-    if (first != last)
-    {
-        if (*first == 'r')
-        {
-            addQualifiers(cv, QualRestrict);
-            ++first;
-        }
-        if (*first == 'V')
-        {
-            addQualifiers(cv, QualVolatile);
-            ++first;
-        }
-        if (*first == 'K')
-        {
-            addQualifiers(cv, QualConst);
-            ++first;
         }
     }
     return first;
@@ -3571,627 +4390,6 @@ parse_unresolved_name(const char* first, const char* last, Db& db)
     return first;
 }
 
-//  <ref-qualifier> ::= R                   # & ref-qualifier
-//  <ref-qualifier> ::= O                   # && ref-qualifier
-
-// <function-type> ::= F [Y] <bare-function-type> [<ref-qualifier>] E
-
-const char*
-parse_function_type(const char* first, const char* last, Db& db)
-{
-    if (first != last && *first == 'F')
-    {
-        const char* t = first+1;
-        if (t != last)
-        {
-            if (*t == 'Y')
-            {
-                /* extern "C" */
-                if (++t == last)
-                    return first;
-            }
-            const char* t1 = parse_type(t, last, db);
-            if (t1 != t && !db.Names.empty())
-            {
-                Node* ret_type = db.Names.back();
-                db.Names.pop_back();
-                size_t params_begin = db.Names.size();
-                t = t1;
-                FunctionRefQual RefQuals = FrefQualNone;
-                while (true)
-                {
-                    if (t == last)
-                    {
-                        if (!db.Names.empty())
-                          db.Names.pop_back();
-                        return first;
-                    }
-                    if (*t == 'E')
-                    {
-                        ++t;
-                        break;
-                    }
-                    if (*t == 'v')
-                    {
-                        ++t;
-                        continue;
-                    }
-                    if (*t == 'R' && t+1 != last && t[1] == 'E')
-                    {
-                        RefQuals = FrefQualLValue;
-                        ++t;
-                        continue;
-                    }
-                    if (*t == 'O' && t+1 != last && t[1] == 'E')
-                    {
-                        RefQuals = FrefQualRValue;
-                        ++t;
-                        continue;
-                    }
-                    size_t k0 = db.Names.size();
-                    t1 = parse_type(t, last, db);
-                    size_t k1 = db.Names.size();
-                    if (t1 == t || t1 == last || k1 < k0)
-                        return first;
-                    t = t1;
-                }
-                if (db.Names.empty() || params_begin > db.Names.size())
-                    return first;
-                Node* fty = db.make<FunctionType>(
-                    ret_type, db.popTrailingNodeArray(params_begin));
-                if (RefQuals)
-                    fty = db.make<FunctionRefQualType>(fty, RefQuals);
-                db.Names.push_back(fty);
-                first = t;
-            }
-        }
-    }
-    return first;
-}
-
-// <pointer-to-member-type> ::= M <class type> <member type>
-
-const char*
-parse_pointer_to_member_type(const char* first, const char* last, Db& db)
-{
-    if (first != last && *first == 'M')
-    {
-        const char* t = parse_type(first+1, last, db);
-        if (t != first+1)
-        {
-            const char* t2 = parse_type(t, last, db);
-            if (t2 != t)
-            {
-                if (db.Names.size() < 2)
-                    return first;
-                auto func = std::move(db.Names.back());
-                db.Names.pop_back();
-                auto ClassType = std::move(db.Names.back());
-                db.Names.back() =
-                    db.make<PointerToMemberType>(ClassType, func);
-                first = t2;
-            }
-        }
-    }
-    return first;
-}
-
-// <array-type> ::= A <positive dimension number> _ <element type>
-//              ::= A [<dimension expression>] _ <element type>
-
-const char*
-parse_array_type(const char* first, const char* last, Db& db)
-{
-    if (first != last && *first == 'A' && first+1 != last)
-    {
-        if (first[1] == '_')
-        {
-            const char* t = parse_type(first+2, last, db);
-            if (t != first+2)
-            {
-                if (db.Names.empty())
-                    return first;
-                db.Names.back() = db.make<ArrayType>(db.Names.back());
-                first = t;
-            }
-        }
-        else if ('1' <= first[1] && first[1] <= '9')
-        {
-            const char* t = parse_number(first+1, last);
-            if (t != last && *t == '_')
-            {
-                const char* t2 = parse_type(t+1, last, db);
-                if (t2 != t+1)
-                {
-                    if (db.Names.empty())
-                        return first;
-                    db.Names.back() =
-                        db.make<ArrayType>(db.Names.back(),
-                                            StringView(first + 1, t));
-                    first = t2;
-                }
-            }
-        }
-        else
-        {
-            const char* t = parse_expression(first+1, last, db);
-            if (t != first+1 && t != last && *t == '_')
-            {
-                const char* t2 = parse_type(++t, last, db);
-                if (t2 != t)
-                {
-                    if (db.Names.size() < 2)
-                        return first;
-                    auto base_type = std::move(db.Names.back());
-                    db.Names.pop_back();
-                    auto dimension_expr = std::move(db.Names.back());
-                    db.Names.back() =
-                        db.make<ArrayType>(base_type, dimension_expr);
-                    first = t2;
-                }
-            }
-        }
-    }
-    return first;
-}
-
-// <decltype>  ::= Dt <expression> E  # decltype of an id-expression or class member access (C++0x)
-//             ::= DT <expression> E  # decltype of an expression (C++0x)
-
-const char*
-parse_decltype(const char* first, const char* last, Db& db)
-{
-    if (last - first >= 4 && first[0] == 'D')
-    {
-        switch (first[1])
-        {
-        case 't':
-        case 'T':
-            {
-                const char* t = parse_expression(first+2, last, db);
-                if (t != first+2 && t != last && *t == 'E')
-                {
-                    if (db.Names.empty())
-                        return first;
-                    db.Names.back() = db.make<EnclosingExpr>(
-                        "decltype(", db.Names.back(), ")");
-                    first = t+1;
-                }
-            }
-            break;
-        }
-    }
-    return first;
-}
-
-// extension:
-// <vector-type>           ::= Dv <positive dimension number> _
-//                                    <extended element type>
-//                         ::= Dv [<dimension expression>] _ <element type>
-// <extended element type> ::= <element type>
-//                         ::= p # AltiVec vector pixel
-
-const char*
-parse_vector_type(const char* first, const char* last, Db& db)
-{
-    if (last - first > 3 && first[0] == 'D' && first[1] == 'v')
-    {
-        if ('1' <= first[2] && first[2] <= '9')
-        {
-            const char* t = parse_number(first+2, last);
-            if (t == last || *t != '_')
-                return first;
-            const char* num = first + 2;
-            size_t sz = static_cast<size_t>(t - num);
-            if (++t != last)
-            {
-                if (*t != 'p')
-                {
-                    const char* t1 = parse_type(t, last, db);
-                    if (t1 != t)
-                    {
-                        if (db.Names.empty())
-                            return first;
-                        db.Names.back() =
-                            db.make<VectorType>(db.Names.back(),
-                                                 StringView(num, num + sz));
-                        first = t1;
-                    }
-                }
-                else
-                {
-                    ++t;
-                    db.Names.push_back(
-                        db.make<VectorType>(StringView(num, num + sz)));
-                    first = t;
-                }
-            }
-        }
-        else
-        {
-            Node* num = nullptr;
-            const char* t1 = first+2;
-            if (*t1 != '_')
-            {
-                const char* t = parse_expression(t1, last, db);
-                if (t != t1)
-                {
-                    if (db.Names.empty())
-                        return first;
-                    num = db.Names.back();
-                    db.Names.pop_back();
-                    t1 = t;
-                }
-            }
-            if (t1 != last && *t1 == '_' && ++t1 != last)
-            {
-                const char* t = parse_type(t1, last, db);
-                if (t != t1)
-                {
-                    if (db.Names.empty())
-                        return first;
-                    if (num)
-                        db.Names.back() =
-                            db.make<VectorType>(db.Names.back(), num);
-                    else
-                        db.Names.back() =
-                            db.make<VectorType>(db.Names.back(), StringView());
-                    first = t;
-                } else if (num)
-                    db.Names.push_back(num);
-            }
-        }
-    }
-    return first;
-}
-
-// <type> ::= <builtin-type>
-//        ::= <function-type>
-//        ::= <class-enum-type>
-//        ::= <array-type>
-//        ::= <pointer-to-member-type>
-//        ::= <template-param>
-//        ::= <template-template-param> <template-args>
-//        ::= <decltype>
-//        ::= <substitution>
-//        ::= <CV-Qualifiers> <type>
-//        ::= P <type>        # pointer-to
-//        ::= R <type>        # reference-to
-//        ::= O <type>        # rvalue reference-to (C++0x)
-//        ::= C <type>        # complex pair (C 2000)
-//        ::= G <type>        # imaginary (C 2000)
-//        ::= Dp <type>       # pack expansion (C++0x)
-//        ::= U <source-name> <type>  # vendor extended type qualifier
-// extension := U <objc-name> <objc-type>  # objc-type<identifier>
-// extension := <vector-type> # <vector-type> starts with Dv
-
-// <objc-name> ::= <k0 number> objcproto <k1 number> <identifier>  # k0 = 9 + <number of digits in k1> + k1
-// <objc-type> := <source-name>  # PU<11+>objcproto 11objc_object<source-name> 11objc_object -> id<source-name>
-
-const char*
-parse_type(const char* first, const char* last, Db& db)
-{
-    if (first != last)
-    {
-        switch (*first)
-        {
-            case 'r':
-            case 'V':
-            case 'K':
-              {
-                Qualifiers cv = QualNone;
-                const char* t = parse_cv_qualifiers(first, last, cv);
-                if (t != first)
-                {
-                    bool is_function = *t == 'F';
-                    size_t k0 = db.Names.size();
-                    const char* t1 = parse_type(t, last, db);
-                    size_t k1 = db.Names.size();
-                    if (t1 != t && k0 + 1 == k1)
-                    {
-                        if (is_function)
-                            db.Subs.pop_back();
-                        if (cv)
-                        {
-                            if (is_function)
-                                db.Names.back() = db.make<FunctionQualType>(
-                                    db.Names.back(), cv);
-                            else
-                                db.Names.back() =
-                                    db.make<QualType>(db.Names.back(), cv);
-                        }
-                        db.Subs.push_back(db.Names.back());
-                        first = t1;
-                    }
-                }
-              }
-                break;
-            default:
-              {
-                const char* t = parse_builtin_type(first, last, db);
-                if (t != first)
-                {
-                    first = t;
-                }
-                else
-                {
-                    switch (*first)
-                    {
-                    case 'A':
-                        t = parse_array_type(first, last, db);
-                        if (t != first)
-                        {
-                            if (db.Names.empty())
-                                return first;
-                            first = t;
-                            db.Subs.push_back(db.Names.back());
-                        }
-                        break;
-                    case 'C':
-                        t = parse_type(first+1, last, db);
-                        if (t != first+1)
-                        {
-                            if (db.Names.empty())
-                                return first;
-                            db.Names.back() = db.make<PostfixQualifiedType>(
-                                db.Names.back(), " complex");
-                            first = t;
-                            db.Subs.push_back(db.Names.back());
-                        }
-                        break;
-                    case 'F':
-                        t = parse_function_type(first, last, db);
-                        if (t != first)
-                        {
-                            if (db.Names.empty())
-                                return first;
-                            first = t;
-                            db.Subs.push_back(db.Names.back());
-                        }
-                        break;
-                    case 'G':
-                        t = parse_type(first+1, last, db);
-                        if (t != first+1)
-                        {
-                            if (db.Names.empty())
-                                return first;
-                            db.Names.back() = db.make<PostfixQualifiedType>(
-                                db.Names.back(), " imaginary");
-                            first = t;
-                            db.Subs.push_back(db.Names.back());
-                        }
-                        break;
-                    case 'M':
-                        t = parse_pointer_to_member_type(first, last, db);
-                        if (t != first)
-                        {
-                            if (db.Names.empty())
-                                return first;
-                            first = t;
-                            db.Subs.push_back(db.Names.back());
-                        }
-                        break;
-                    case 'O':
-                      {
-                        size_t k0 = db.Names.size();
-                        t = parse_type(first+1, last, db);
-                        size_t k1 = db.Names.size();
-                        if (t != first+1 && k0 + 1 == k1)
-                        {
-                            db.Names.back() =
-                                db.make<RValueReferenceType>(db.Names.back());
-                            db.Subs.push_back(db.Names.back());
-                            first = t;
-                        }
-                        break;
-                      }
-                    case 'P':
-                      {
-                        size_t k0 = db.Names.size();
-                        t = parse_type(first+1, last, db);
-                        size_t k1 = db.Names.size();
-                        if (t != first+1 && k0 + 1 == k1)
-                        {
-                            db.Names.back() = db.make<PointerType>(db.Names.back());
-                            db.Subs.push_back(db.Names.back());
-                            first = t;
-                        }
-                        break;
-                      }
-                    case 'R':
-                      {
-                        size_t k0 = db.Names.size();
-                        t = parse_type(first+1, last, db);
-                        size_t k1 = db.Names.size();
-                        if (t != first+1 && k0 + 1 == k1)
-                        {
-                            db.Names.back() =
-                                db.make<LValueReferenceType>(db.Names.back());
-                            db.Subs.push_back(db.Names.back());
-                            first = t;
-                        }
-                        break;
-                      }
-                    case 'T':
-                      {
-                        size_t k0 = db.Names.size();
-                        t = parse_template_param(first, last, db);
-                        size_t k1 = db.Names.size();
-                        if (t != first && k0 + 1 == k1)
-                        {
-                            db.Subs.push_back(db.Names.back());
-                            if (db.TryToParseTemplateArgs && k1 == k0+1)
-                            {
-                                const char* t1 = parse_template_args(t, last, db);
-                                if (t1 != t)
-                                {
-                                    auto args = db.Names.back();
-                                    db.Names.pop_back();
-                                    db.Names.back() = db.make<
-                                        NameWithTemplateArgs>(
-                                        db.Names.back(), args);
-                                    db.Subs.push_back(db.Names.back());
-                                    t = t1;
-                                }
-                            }
-                            first = t;
-                        }
-                        break;
-                      }
-                    case 'U':
-                        if (first+1 != last)
-                        {
-                            t = parse_source_name(first+1, last, db);
-                            if (t != first+1)
-                            {
-                                const char* t2 = parse_type(t, last, db);
-                                if (t2 != t)
-                                {
-                                    if (db.Names.size() < 2)
-                                        return first;
-                                    auto type = db.Names.back();
-                                    db.Names.pop_back();
-                                    if (db.Names.back()->K != Node::KNameType ||
-                                        !static_cast<NameType*>(db.Names.back())->getName().startsWith("objcproto"))
-                                    {
-                                        db.Names.back() = db.make<VendorExtQualType>(type, db.Names.back());
-                                    }
-                                    else
-                                    {
-                                        auto* proto = static_cast<NameType*>(db.Names.back());
-                                        db.Names.pop_back();
-                                        t = parse_source_name(proto->getName().begin() + 9, proto->getName().end(), db);
-                                        if (t != proto->getName().begin() + 9)
-                                        {
-                                            db.Names.back() = db.make<ObjCProtoName>(type, db.Names.back());
-                                        }
-                                        else
-                                        {
-                                            db.Names.push_back(db.make<VendorExtQualType>(type, proto));
-                                        }
-                                    }
-                                    db.Subs.push_back(db.Names.back());
-                                    first = t2;
-                                }
-                            }
-                        }
-                        break;
-                    case 'S':
-                        if (first+1 != last && first[1] == 't')
-                        {
-                            t = parse_name(first, last, db);
-                            if (t != first)
-                            {
-                                if (db.Names.empty())
-                                    return first;
-                                db.Subs.push_back(db.Names.back());
-                                first = t;
-                            }
-                        }
-                        else
-                        {
-                            t = parse_substitution(first, last, db);
-                            if (t != first)
-                            {
-                                first = t;
-                                // Parsed a substitution.  If the substitution is a
-                                //  <template-param> it might be followed by <template-args>.
-                                if (db.TryToParseTemplateArgs)
-                                {
-                                    t = parse_template_args(first, last, db);
-                                    if (t != first)
-                                    {
-                                        if (db.Names.size() < 2)
-                                            return first;
-                                        auto template_args = db.Names.back();
-                                        db.Names.pop_back();
-                                        db.Names.back() = db.make<
-                                          NameWithTemplateArgs>(
-                                              db.Names.back(), template_args);
-                                        // Need to create substitution for <template-template-param> <template-args>
-                                        db.Subs.push_back(db.Names.back());
-                                        first = t;
-                                    }
-                                }
-                            }
-                        }
-                        break;
-                    case 'D':
-                        if (first+1 != last)
-                        {
-                            switch (first[1])
-                            {
-                            case 'p':
-                              {
-                                size_t k0 = db.Names.size();
-                                t = parse_type(first+2, last, db);
-                                size_t k1 = db.Names.size();
-                                if (t != first+2 && k0 + 1 == k1)
-                                {
-                                    db.Names.back() =
-                                        db.make<ParameterPackExpansion>(
-                                            db.Names.back());
-                                    db.Subs.push_back(db.Names.back());
-                                    first = t;
-                                    return first;
-                                }
-                                break;
-                              }
-                            case 't':
-                            case 'T':
-                                t = parse_decltype(first, last, db);
-                                if (t != first)
-                                {
-                                    if (db.Names.empty())
-                                        return first;
-                                    db.Subs.push_back(db.Names.back());
-                                    first = t;
-                                    return first;
-                                }
-                                break;
-                            case 'v':
-                                t = parse_vector_type(first, last, db);
-                                if (t != first)
-                                {
-                                    if (db.Names.empty())
-                                        return first;
-                                    db.Subs.push_back(db.Names.back());
-                                    first = t;
-                                    return first;
-                                }
-                                break;
-                            }
-                        }
-                        _LIBCPP_FALLTHROUGH();
-                    default:
-                        // must check for builtin-types before class-enum-types to avoid
-                        // ambiguities with operator-names
-                        t = parse_builtin_type(first, last, db);
-                        if (t != first)
-                        {
-                            first = t;
-                        }
-                        else
-                        {
-                            t = parse_name(first, last, db);
-                            if (t != first)
-                            {
-                                if (db.Names.empty())
-                                    return first;
-                                db.Subs.push_back(db.Names.back());
-                                first = t;
-                            }
-                        }
-                        break;
-                    }
-              }
-                break;
-            }
-        }
-    }
-    return first;
-}
-
 //   <operator-name>
 //                   ::= aa    # &&            
 //                   ::= ad    # & (unary)     
@@ -4551,81 +4749,6 @@ parse_operator_name(const char* first, const char* last, Db& db)
     return first;
 }
 
-Node* maybe_change_special_sub_name(Node* inp, Db& db)
-{
-    if (inp->K != Node::KSpecialSubstitution)
-        return inp;
-    auto Kind = static_cast<SpecialSubstitution*>(inp)->SSK;
-    switch (Kind)
-    {
-    case SpecialSubKind::string:
-    case SpecialSubKind::istream:
-    case SpecialSubKind::ostream:
-    case SpecialSubKind::iostream:
-        return db.make<ExpandedSpecialSubstitution>(Kind);
-    default:
-        break;
-    }
-    return inp;
-}
-
-// <ctor-dtor-name> ::= C1    # complete object constructor
-//                  ::= C2    # base object constructor
-//                  ::= C3    # complete object allocating constructor
-//   extension      ::= C5    # ?
-//                  ::= D0    # deleting destructor
-//                  ::= D1    # complete object destructor
-//                  ::= D2    # base object destructor
-//   extension      ::= D5    # ?
-//   extension      ::= <ctor-dtor-name> <abi-tag-seq>
-const char*
-parse_ctor_dtor_name(const char* first, const char* last, Db& db)
-{
-    if (last-first >= 2 && !db.Names.empty())
-    {
-        switch (first[0])
-        {
-        case 'C':
-            switch (first[1])
-            {
-            case '1':
-            case '2':
-            case '3':
-            case '5':
-                if (db.Names.empty())
-                    return first;
-                db.Names.back() =
-                    maybe_change_special_sub_name(db.Names.back(), db);
-                db.Names.push_back(
-                    db.make<CtorDtorName>(db.Names.back(), false));
-                first += 2;
-                first = parse_abi_tag_seq(first, last, db);
-                db.ParsedCtorDtorCV = true;
-                break;
-            }
-            break;
-        case 'D':
-            switch (first[1])
-            {
-            case '0':
-            case '1':
-            case '2':
-            case '5':
-                if (db.Names.empty())
-                    return first;
-                db.Names.push_back(
-                    db.make<CtorDtorName>(db.Names.back(), true));
-                first += 2;
-                first = parse_abi_tag_seq(first, last, db);
-                db.ParsedCtorDtorCV = true;
-                break;
-            }
-            break;
-        }
-    }
-    return first;
-}
-
 // <unnamed-type-name> ::= Ut [<nonnegative number>] _ [<abi-tag-seq>]
 //                     ::= <closure-type-name>
 // 
@@ -4716,17 +4839,13 @@ parse_unnamed_type_name(const char* first, const char* last, Db& db)
 const char*
 parse_unqualified_name(const char* first, const char* last, Db& db)
 {
+    // <ctor-dtor-name>s are special-cased in parseNestedName().
+
     if (first != last)
     {
         const char* t;
         switch (*first)
         {
-        case 'C':
-        case 'D':
-            t = parse_ctor_dtor_name(first, last, db);
-            if (t != first)
-                first = t;
-            break;
         case 'U':
             t = parse_unnamed_type_name(first, last, db);
             if (t != first)
@@ -4891,178 +5010,6 @@ parse_template_args(const char* first, const char* last, Db& db)
         auto *tp = db.make<TemplateArgs>(
             db.popTrailingNodeArray(begin_idx));
         db.Names.push_back(tp);
-    }
-    return first;
-}
-
-// <nested-name> ::= N [<CV-Qualifiers>] [<ref-qualifier>] <prefix> <unqualified-name> E
-//               ::= N [<CV-Qualifiers>] [<ref-qualifier>] <template-prefix> <template-args> E
-// 
-// <prefix> ::= <prefix> <unqualified-name>
-//          ::= <template-prefix> <template-args>
-//          ::= <template-param>
-//          ::= <decltype>
-//          ::= # empty
-//          ::= <substitution>
-//          ::= <prefix> <data-member-prefix>
-//  extension ::= L
-// 
-// <template-prefix> ::= <prefix> <template unqualified-name>
-//                   ::= <template-param>
-//                   ::= <substitution>
-
-const char*
-parse_nested_name(const char* first, const char* last, Db& db,
-                  bool* ends_with_template_args)
-{
-    if (first != last && *first == 'N')
-    {
-        Qualifiers cv;
-        const char* t0 = parse_cv_qualifiers(first+1, last, cv);
-        if (t0 == last)
-            return first;
-        db.RefQuals = FrefQualNone;
-        if (*t0 == 'R')
-        {
-            db.RefQuals = FrefQualLValue;
-            ++t0;
-        }
-        else if (*t0 == 'O')
-        {
-            db.RefQuals = FrefQualRValue;
-            ++t0;
-        }
-        db.Names.push_back(db.make<EmptyName>());
-        if (last - t0 >= 2 && t0[0] == 'S' && t0[1] == 't')
-        {
-            t0 += 2;
-            db.Names.back() = db.make<NameType>("std");
-        }
-        if (t0 == last)
-            return first;
-        bool pop_subs = false;
-        bool component_ends_with_template_args = false;
-        while (*t0 != 'E')
-        {
-            component_ends_with_template_args = false;
-            const char* t1;
-            switch (*t0)
-            {
-            case 'S':
-                if (t0 + 1 != last && t0[1] == 't')
-                    goto do_parse_unqualified_name;
-                t1 = parse_substitution(t0, last, db);
-                if (t1 != t0 && t1 != last)
-                {
-                    if (db.Names.size() < 2)
-                        return first;
-                    auto name = db.Names.back();
-                    db.Names.pop_back();
-                    if (db.Names.back()->K != Node::KEmptyName)
-                    {
-                        db.Names.back() = db.make<QualifiedName>(
-                            db.Names.back(), name);
-                        db.Subs.push_back(db.Names.back());
-                    }
-                    else
-                        db.Names.back() = name;
-                    pop_subs = true;
-                    t0 = t1;
-                }
-                else
-                    return first;
-                break;
-            case 'T':
-                t1 = parse_template_param(t0, last, db);
-                if (t1 != t0 && t1 != last)
-                {
-                    if (db.Names.size() < 2)
-                        return first;
-                    auto name = db.Names.back();
-                    db.Names.pop_back();
-                    if (db.Names.back()->K != Node::KEmptyName)
-                        db.Names.back() =
-                            db.make<QualifiedName>(db.Names.back(), name);
-                    else
-                        db.Names.back() = name;
-                    db.Subs.push_back(db.Names.back());
-                    pop_subs = true;
-                    t0 = t1;
-                }
-                else
-                    return first;
-                break;
-            case 'D':
-                if (t0 + 1 != last && t0[1] != 't' && t0[1] != 'T')
-                    goto do_parse_unqualified_name;
-                t1 = parse_decltype(t0, last, db);
-                if (t1 != t0 && t1 != last)
-                {
-                    if (db.Names.size() < 2)
-                        return first;
-                    auto name = db.Names.back();
-                    db.Names.pop_back();
-                    if (db.Names.back()->K != Node::KEmptyName)
-                        db.Names.back() =
-                            db.make<QualifiedName>(db.Names.back(), name);
-                    else
-                        db.Names.back() = name;
-                    db.Subs.push_back(db.Names.back());
-                    pop_subs = true;
-                    t0 = t1;
-                }
-                else
-                    return first;
-                break;
-            case 'I':
-                t1 = parse_template_args(t0, last, db);
-                if (t1 != t0 && t1 != last)
-                {
-                    if (db.Names.size() < 2)
-                        return first;
-                    auto name = db.Names.back();
-                    db.Names.pop_back();
-                    db.Names.back() = db.make<NameWithTemplateArgs>(
-                        db.Names.back(), name);
-                    db.Subs.push_back(db.Names.back());
-                    t0 = t1;
-                    component_ends_with_template_args = true;
-                }
-                else
-                    return first;
-                break;
-            case 'L':
-                if (++t0 == last)
-                    return first;
-                break;
-            default:
-            do_parse_unqualified_name:
-                t1 = parse_unqualified_name(t0, last, db);
-                if (t1 != t0 && t1 != last)
-                {
-                    if (db.Names.size() < 2)
-                        return first;
-                    auto name = db.Names.back();
-                    db.Names.pop_back();
-                    if (db.Names.back()->K != Node::KEmptyName)
-                        db.Names.back() =
-                            db.make<QualifiedName>(db.Names.back(), name);
-                    else
-                        db.Names.back() = name;
-                    db.Subs.push_back(db.Names.back());
-                    pop_subs = true;
-                    t0 = t1;
-                }
-                else
-                    return first;
-            }
-        }
-        first = t0 + 1;
-        db.CV = cv;
-        if (pop_subs && !db.Subs.empty())
-            db.Subs.pop_back();
-        if (ends_with_template_args)
-            *ends_with_template_args = component_ends_with_template_args;
     }
     return first;
 }
@@ -5613,7 +5560,7 @@ parse_encoding(const char* first, const char* last, Db& db)
                         Node* name = db.Names.back();
                         db.Names.pop_back();
                         result = db.make<FunctionEncoding>(
-                            return_type, name, NodeArray());
+                            return_type, name, NodeArray(), cv, ref);
                     }
                     else
                     {
@@ -5634,12 +5581,8 @@ parse_encoding(const char* first, const char* last, Db& db)
                         Node* name = db.Names.back();
                         db.Names.pop_back();
                         result = db.make<FunctionEncoding>(
-                            return_type, name, params);
+                            return_type, name, params, cv, ref);
                     }
-                    if (ref != FrefQualNone)
-                        result = db.make<FunctionRefQualType>(result, ref);
-                    if (cv != QualNone)
-                        result = db.make<FunctionQualType>(result, cv);
                     db.Names.push_back(result);
                     first = t;
                 }
